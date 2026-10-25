@@ -1,0 +1,30 @@
+[package]
+name = "tnet-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+toml = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+url = "2.4"
+percent-encoding = "2.3"
+mlua = { version = "0.9", features = ["lua54", "send"] }
+rhai = "1.19"
+walkdir = "2"
+
+[[bin]]
+name = "utnp-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "utnp-client"
+path = "src/client.rs"
+
+[[bin]]
+name = "tmutp-server"
+path = "src/tmutp.rs"
+
+[[bin]]
+name = "tbip-server"
+path = "src/tbip.rs"
