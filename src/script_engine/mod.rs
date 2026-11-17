@@ -57,19 +57,6 @@ impl Default for ScriptingConfig {
     }
 }
 
-// (утилита для нормализации пути, не используется сейчас, но оставлена)
-pub fn normalize_script_path(root: &Path, full_path: &Path, ext: &str) -> Option<String> {
-    let rel = full_path.strip_prefix(root).ok()?;
-    let rel_str = rel.to_str()?;
-    let without_ext = rel_str.trim_end_matches(ext);
-    let key = if without_ext.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", without_ext)
-    };
-    Some(key)
-}
-
 /// Проверяет существующий путь и запрещает выход за пределы root.
 /// Каноникализация учитывает `..`, симлинки и другие компоненты пути.
 pub fn resolve_existing_path(root: &Path, requested: &str) -> io::Result<PathBuf> {

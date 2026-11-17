@@ -1,4 +1,3 @@
-
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
@@ -84,6 +83,7 @@ struct AppState {
 // -----------------------------------------------------------------------------
 
 const OK: &str = "20 OK";
+#[allow(dead_code)]
 const OK_EMPTY: &str = "22 OK EMPTY";
 const BAD_REQUEST: &str = "30 BAD REQUEST";
 const NOT_FOUND: &str = "31 NOT FOUND";
@@ -92,6 +92,8 @@ const SERVER_ERROR: &str = "40 SERVER ERROR";
 const METHOD_NOT_ALLOWED: &str = "50 METHOD NOT ALLOWED";
 const VERSION_NOT_SUPPORTED: &str = "51 VERSION NOT SUPPORTED";
 const REQUIRE_SECURE: &str = "55 REQUIRE SECURE";
+
+const TMUTP_VERSION: &str = "TMUTP/2.0";
 
 fn status_code_to_text(code: u16) -> &'static str {
     match code {
@@ -107,6 +109,9 @@ fn status_code_to_text(code: u16) -> &'static str {
         42 => "SERVICE UNAVAILABLE",
         50 => "METHOD NOT ALLOWED",
         51 => "VERSION NOT SUPPORTED",
+        52 => "INVALID RANGE",
+        53 => "RANGE NOT SATISFIABLE",
+        54 => "UNSUPPORTED RANGE",
         55 => "REQUIRE SECURE",
         _ => "UNKNOWN",
     }
@@ -182,6 +187,7 @@ async fn main() -> Result<()> {
 
     println!("TMUTP server listening on port {}", config.port);
     println!("Serving files from {}", config.root);
+    println!("Protocol version: {}", TMUTP_VERSION);
     println!("TSTS (require_secure): {}", state.require_secure);
     println!("TLS enabled: {}", tls_acceptor.is_some());
     println!("SSH enabled: {}", ssh_config.is_some());
@@ -380,7 +386,6 @@ where
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 4096];
 
-        // Read enough bytes to determine the complete TMUTP request.
         loop {
             let n = stream.read(&mut chunk).await?;
 
@@ -393,7 +398,7 @@ where
             if buffer.len() > 16 * 1024 * 1024 {
                 let response = make_error_response(
                     BAD_REQUEST,
-                    "Request too large",
+                    "30 Bad request",
                     "The request exceeds the server limit",
                 );
 
@@ -419,10 +424,9 @@ where
                     stream.write_all(&response).await?;
                     stream.flush().await?;
 
-                    // Preserve any bytes read beyond the first request.
-                    // They are processed as the next request on this connection.
                     if !buffer.is_empty() {
                         let mut pending = buffer;
+
                         loop {
                             if let Some(frame_len) = complete_request_len(&pending) {
                                 if pending.len() >= frame_len {
@@ -496,9 +500,6 @@ impl Handler for TmutpSshHandler {
         Ok(())
     }
 
-    // ssh -T without a remote command requests a session shell.
-    // Accept the channel request, but do NOT start a system shell.
-    // Channel data remains a raw TMUTP byte stream.
     async fn shell_request(
         &mut self,
         channel: ChannelId,
@@ -508,7 +509,6 @@ impl Handler for TmutpSshHandler {
         Ok(())
     }
 
-    // No PTY is needed. ssh -T does not request one.
     async fn pty_request(
         &mut self,
         channel: ChannelId,
@@ -546,13 +546,7 @@ impl Handler for TmutpSshHandler {
             }
 
             let request: Vec<u8> = buffer.drain(..frame_len).collect();
-
-            let response = if self.state.require_secure {
-                // SSH is an encrypted transport.
-                process_request(&request, &self.state)
-            } else {
-                process_request(&request, &self.state)
-            };
+            let response = process_request(&request, &self.state);
 
             session.data(channel, Bytes::from(response))?;
         }
@@ -638,7 +632,25 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
 
-    if parts.len() < 3 {
+    // The version is checked before validating the rest of the request line.
+    // This ensures that "TMUTP/3.0 GET" receives 51, not 30.
+    if parts.is_empty() {
+        return make_error_response(
+            BAD_REQUEST,
+            "30 Bad request",
+            "Request line is missing",
+        );
+    }
+
+    if parts[0] != TMUTP_VERSION {
+        return make_error_response(
+            VERSION_NOT_SUPPORTED,
+            "51 Version not supported",
+            "Server supports only TMUTP/2.0",
+        );
+    }
+
+    if parts.len() != 3 {
         return make_error_response(
             BAD_REQUEST,
             "30 Bad request",
@@ -646,17 +658,8 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
         );
     }
 
-    let version = parts[0];
     let method = parts[1];
     let raw_path = parts[2];
-
-    if version != "TMUTP/1.0" {
-        return make_error_response(
-            VERSION_NOT_SUPPORTED,
-            "51 Version not supported",
-            "Server supports only TMUTP/1.0",
-        );
-    }
 
     if method != "GET" && method != "POST" {
         return make_error_response(
@@ -907,7 +910,8 @@ fn find_header_end(raw: &[u8]) -> Option<usize> {
 fn make_script_response(response: Response) -> Vec<u8> {
     let status_text = status_code_to_text(response.status);
     let status_line = format!(
-        "TMUTP/1.0 {} {}\n",
+        "{} {} {}\n",
+        TMUTP_VERSION,
         response.status,
         status_text
     );
@@ -929,7 +933,8 @@ fn make_script_response(response: Response) -> Vec<u8> {
 
 fn make_response(status: &str, body: &[u8]) -> Vec<u8> {
     let header = format!(
-        "TMUTP/1.0 {}\nContent-Length: {}\n\n",
+        "{} {}\nContent-Length: {}\n\n",
+        TMUTP_VERSION,
         status,
         body.len()
     );
@@ -940,7 +945,11 @@ fn make_response(status: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn make_empty_response() -> Vec<u8> {
-    b"TMUTP/1.0 22 OK EMPTY\nContent-Length: 0\n\n".to_vec()
+    format!(
+        "{} 22 OK EMPTY\nContent-Length: 0\n\n",
+        TMUTP_VERSION
+    )
+    .into_bytes()
 }
 
 fn make_error_response(
@@ -968,15 +977,11 @@ fn resolve_path(root: &str, path: &str) -> std::io::Result<Option<PathBuf>> {
 
     let canonical_root = fs::canonicalize(root)?;
 
-    // Обратные слеши тоже считаем разделителями пути.
     let normalized_path = path.replace('\\', "/");
     let is_directory = normalized_path.is_empty() || normalized_path.ends_with('/');
 
     let mut relative = PathBuf::new();
 
-    // Сначала проверяем выход за root лексически.
-    // Это важно: canonicalize() сам по себе вернёт NotFound,
-    // если атакующий указал несуществующий путь за пределами root.
     for component in PathBuf::from(&normalized_path).components() {
         match component {
             Component::Prefix(_) => {
@@ -1003,7 +1008,6 @@ fn resolve_path(root: &str, path: &str) -> std::io::Result<Option<PathBuf>> {
         relative.push("index.tmkup");
     }
 
-    // Затем проверяем реальные пути с учётом симлинков.
     let mut current = canonical_root.clone();
     let components: Vec<_> = relative.components().collect();
 

@@ -10,6 +10,7 @@ use super::{
     resolve_write_path,
 };
 
+#[allow(dead_code)]
 pub struct LuaEngine {
     root: PathBuf,
     extension: String,

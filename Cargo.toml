@@ -13,7 +13,6 @@ url = "2.4"
 percent-encoding = "2.3"
 mlua = { version = "0.9", features = ["lua54", "send"] }
 rhai = "1.19"
-walkdir = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26.6"
 rustls-pemfile = "2"

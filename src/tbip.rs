@@ -1,4 +1,3 @@
-
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
@@ -80,16 +79,25 @@ struct AppState {
 }
 
 // -----------------------------------------------------------------------------
+// Protocol version
+// -----------------------------------------------------------------------------
+
+const TBIP_VERSION: &str = "TBIP/2.0";
+
+// -----------------------------------------------------------------------------
 // Status codes
 // -----------------------------------------------------------------------------
 
 const OK: &str = "20 OK";
+#[allow(dead_code)]
 const MOVED: &str = "21 MOVED";
+#[allow(dead_code)]
 const OK_EMPTY: &str = "22 OK EMPTY";
 const BAD_REQUEST: &str = "30 BAD REQUEST";
 const NOT_FOUND: &str = "31 NOT FOUND";
 const FORBIDDEN: &str = "32 FORBIDDEN";
 const SERVER_ERROR: &str = "40 SERVER ERROR";
+#[allow(dead_code)]
 const SERVICE_UNAVAILABLE: &str = "42 SERVICE UNAVAILABLE";
 const METHOD_NOT_ALLOWED: &str = "50 METHOD NOT ALLOWED";
 const VERSION_NOT_SUPPORTED: &str = "51 VERSION NOT SUPPORTED";
@@ -566,6 +574,19 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
 
+    // Check the protocol version before validating the rest of the request line.
+    // This ensures that an unsupported version receives 51 even if the request
+    // line is otherwise incomplete.
+    if let Some(version) = parts.first() {
+        if *version != TBIP_VERSION {
+            return make_error_response(
+                VERSION_NOT_SUPPORTED,
+                "51 Version not supported",
+                "Server supports only TBIP/2.0",
+            );
+        }
+    }
+
     if parts.len() != 3 {
         return make_error_response(
             BAD_REQUEST,
@@ -574,17 +595,8 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
         );
     }
 
-    let version = parts[0];
     let method = parts[1];
     let raw_path = parts[2];
-
-    if version != "TBIP/1.0" {
-        return make_error_response(
-            VERSION_NOT_SUPPORTED,
-            "51 Version not supported",
-            "Server supports only TBIP/1.0",
-        );
-    }
 
     if method != "GET" && method != "HEAD" {
         return make_error_response(
@@ -823,7 +835,8 @@ fn make_script_response(response: Response, method: &str) -> Vec<u8> {
     let status_text = status_code_to_text(response.status);
 
     let mut output = format!(
-        "TBIP/1.0 {} {}\n",
+        "{} {} {}\n",
+        TBIP_VERSION,
         response.status,
         status_text
     );
@@ -847,7 +860,8 @@ fn make_script_response(response: Response, method: &str) -> Vec<u8> {
 
 fn make_binary_response(status: &str, mime: &str, data: &[u8]) -> Vec<u8> {
     let header = format!(
-        "TBIP/1.0 {}\nContent-Type: {}\nContent-Length: {}\n\n",
+        "{} {}\nContent-Type: {}\nContent-Length: {}\n\n",
+        TBIP_VERSION,
         status,
         mime,
         data.len()
@@ -860,7 +874,8 @@ fn make_binary_response(status: &str, mime: &str, data: &[u8]) -> Vec<u8> {
 
 fn make_head_response(status: &str, mime: &str, len: u64) -> Vec<u8> {
     format!(
-        "TBIP/1.0 {}\nContent-Type: {}\nContent-Length: {}\n\n",
+        "{} {}\nContent-Type: {}\nContent-Length: {}\n\n",
+        TBIP_VERSION,
         status,
         mime,
         len
@@ -869,7 +884,11 @@ fn make_head_response(status: &str, mime: &str, len: u64) -> Vec<u8> {
 }
 
 fn make_empty_response() -> Vec<u8> {
-    b"TBIP/1.0 22 OK EMPTY\nContent-Length: 0\n\n".to_vec()
+    format!(
+        "{} 22 OK EMPTY\nContent-Length: 0\n\n",
+        TBIP_VERSION
+    )
+    .into_bytes()
 }
 
 fn make_error_response(
@@ -878,7 +897,8 @@ fn make_error_response(
     _message: &str,
 ) -> Vec<u8> {
     format!(
-        "TBIP/1.0 {}\nContent-Length: 0\n\n",
+        "{} {}\nContent-Length: 0\n\n",
+        TBIP_VERSION,
         status
     )
     .into_bytes()

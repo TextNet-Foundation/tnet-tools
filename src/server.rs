@@ -209,7 +209,7 @@ fn load_ssh_config(security: &SecurityConfig) -> Result<Arc<russh::server::Confi
 }
 
 async fn dispatch_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
@@ -333,10 +333,8 @@ fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
     let (version, legacy) = match parts[0] {
         "UTNP/2.0" => ("2.0", false),
         "UTNP/1.0" if state.support_first_version => ("1.0", true),
-        "UTNP/1.0" => {
-            return b"UTNP ERROR - UNSUPPORTED UTNP VERSION, SUPPORTED UTNP/2.0\n".to_vec()
-        }
-        _ => return b"UTNP ERROR - UNSUPPORTED UTNP VERSION, SUPPORTED UTNP/2.0\n".to_vec(),
+        "UTNP/1.0" => return unsupported_utnp_version_response(state),
+        _ => return unsupported_utnp_version_response(state),
     };
 
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -392,6 +390,22 @@ fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
         "EXPLORE" if !legacy && parts.len() == 2 => explore_response(&state.explore_nodes),
         _ => error_response(version, "Invalid request"),
     }
+}
+
+// Build the unsupported-version response from the versions this server
+// actually accepts, rather than hardcoding UTNP/2.0.
+fn unsupported_utnp_version_response(state: &AppState) -> Vec<u8> {
+    let mut supported = vec!["UTNP/2.0"];
+
+    if state.support_first_version {
+        supported.push("UTNP/1.0");
+    }
+
+    format!(
+        "UTNP ERROR - UNSUPPORTED UTNP VERSION, SUPPORTED {}\n",
+        supported.join(", ")
+    )
+    .into_bytes()
 }
 
 fn error_response(version: &str, message: &str) -> Vec<u8> {
