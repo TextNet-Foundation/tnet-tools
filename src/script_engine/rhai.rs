@@ -2,7 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use rhai::{Engine, Scope, Map, Dynamic};
-use super::{Request, Response, ScriptEngine};
+use super::{
+    Request,
+    Response,
+    ScriptEngine,
+    resolve_existing_path,
+    resolve_write_path,
+};
 
 pub struct RhaiEngine {
     root: PathBuf,
@@ -37,7 +43,17 @@ impl RhaiEngine {
     }
 
     fn script_exists(&self, path: &str) -> bool {
-        self.script_path(path).exists()
+        let script_path = self.script_path(path);
+
+        resolve_existing_path(
+            &self.root,
+            script_path.strip_prefix(&self.root)
+                .unwrap_or(&script_path)
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .map(|p| p.is_file())
+        .unwrap_or(false)
     }
 }
 
@@ -48,7 +64,17 @@ impl ScriptEngine for RhaiEngine {
 
     fn execute(&self, path: &str, req: &Request) -> Result<Option<Response>, String> {
         let script_path = self.script_path(path);
-        if !script_path.exists() {
+
+        let script_path = resolve_existing_path(
+            &self.root,
+            script_path.strip_prefix(&self.root)
+                .unwrap_or(&script_path)
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        if !script_path.is_file() {
             return Err("Script not found".to_string());
         }
 
@@ -113,43 +139,41 @@ impl ScriptEngine for RhaiEngine {
             m
         });
 
-        // Файловые функции
+        // Файловые функции с обязательной проверкой границ root.
         let root = self.root.clone();
+
         engine.register_fn("read_file", move |path: String| -> Result<String, String> {
-            let full = root.join(path.trim_start_matches('/'));
-            if !full.starts_with(&root) {
-                return Err("Access denied".to_string());
-            }
+            let full = resolve_existing_path(&root, &path)
+                .map_err(|e| e.to_string())?;
+
             fs::read_to_string(&full).map_err(|e| e.to_string())
         });
 
         let root2 = self.root.clone();
+
         engine.register_fn("write_file", move |(path, data): (String, String)| -> Result<(), String> {
-            let full = root2.join(path.trim_start_matches('/'));
-            if !full.starts_with(&root2) {
-                return Err("Access denied".to_string());
-            }
-            if let Some(parent) = full.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
+            let full = resolve_write_path(&root2, &path)
+                .map_err(|e| e.to_string())?;
+
             fs::write(&full, data).map_err(|e| e.to_string())
         });
 
         let root3 = self.root.clone();
+
         engine.register_fn("exists", move |path: String| -> Result<bool, String> {
-            let full = root3.join(path.trim_start_matches('/'));
-            if !full.starts_with(&root3) {
-                return Err("Access denied".to_string());
+            match resolve_existing_path(&root3, &path) {
+                Ok(full) => Ok(full.exists()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e.to_string()),
             }
-            Ok(full.exists())
         });
 
         let root4 = self.root.clone();
+
         engine.register_fn("remove_file", move |path: String| -> Result<(), String> {
-            let full = root4.join(path.trim_start_matches('/'));
-            if !full.starts_with(&root4) {
-                return Err("Access denied".to_string());
-            }
+            let full = resolve_existing_path(&root4, &path)
+                .map_err(|e| e.to_string())?;
+
             fs::remove_file(&full).map_err(|e| e.to_string())
         });
 
