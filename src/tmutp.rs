@@ -405,6 +405,7 @@ where
 
                 stream.write_all(&response).await?;
                 stream.flush().await?;
+                stream.shutdown().await?;
                 return Ok(());
             }
 
@@ -452,12 +453,14 @@ where
 
                             let n = stream.read(&mut chunk).await?;
                             if n == 0 {
+                                stream.shutdown().await?;
                                 return Ok(());
                             }
 
                             pending.extend_from_slice(&chunk[..n]);
 
                             if pending.len() > 16 * 1024 * 1024 {
+                                stream.shutdown().await?;
                                 return Ok(());
                             }
                         }

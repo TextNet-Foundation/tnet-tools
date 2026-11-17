@@ -421,6 +421,7 @@ where
 
             stream.write_all(&response).await?;
             stream.flush().await?;
+            stream.shutdown().await?;
             return Ok(());
         }
 
