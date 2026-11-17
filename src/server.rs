@@ -31,6 +31,8 @@ struct Config {
 #[derive(Debug, Deserialize, Default, Clone)]
 struct SecurityConfig {
     #[serde(default)]
+    require_secure: bool,
+    #[serde(default)]
     enable_ssh: bool,
     #[serde(default)]
     enable_tls: bool,
@@ -82,6 +84,7 @@ struct AppState {
     explore_nodes: Arc<Vec<ExploreNode>>,
     support_first_version: bool,
     enabled_security: Vec<String>,
+    require_secure: bool,
 }
 
 #[tokio::main]
@@ -110,11 +113,18 @@ async fn main() -> Result<()> {
         enabled_security.push("ssh".to_string());
     }
 
+    if config.security.require_secure && enabled_security.is_empty() {
+        return Err(anyhow!(
+            "security.require_secure=true requires at least one enabled protected transport (TLS or SSH)"
+        ));
+    }
+
     let state = AppState {
         protocols: Arc::new(config.protocols),
         explore_nodes: Arc::new(config.explore.nodes),
         support_first_version: config.support_first_version,
         enabled_security,
+        require_secure: config.security.require_secure,
     };
 
     let listener = TcpListener::bind("0.0.0.0:34").await?;
@@ -126,6 +136,7 @@ async fn main() -> Result<()> {
     );
     println!("TLS enabled: {}", tls_acceptor.is_some());
     println!("SSH enabled: {}", ssh_config.is_some());
+    println!("USTS (secure transport required): {}", state.require_secure);
     if ssh_config.is_some() {
         println!("SSH authentication: none (transport only)");
     }
@@ -215,10 +226,11 @@ async fn dispatch_connection(
             )
             .await
             .context("TLS handshake timed out")??;
-            serve_utnp(tls, state).await?;
+            serve_utnp(tls, state, true).await?;
         }
         "ssh" => {
             let config = ssh_config.ok_or_else(|| anyhow!("SSH handshake received but SSH is disabled"))?;
+            // SSH provides the protected transport; USTS therefore permits UTNP frames here.
             let handler = SshHandler {
                 state,
                 buffers: HashMap::new(),
@@ -226,7 +238,7 @@ async fn dispatch_connection(
             let session = russh::server::run_stream(config, stream, handler).await?;
             session.await?;
         }
-        _ => serve_utnp(stream, state).await?,
+        _ => serve_utnp(stream, state, false).await?,
     }
     let _ = peer;
     Ok(())
@@ -261,11 +273,22 @@ async fn sniff_transport(stream: &TcpStream) -> Result<String> {
     Ok("plain".into())
 }
 
-async fn serve_utnp<S>(stream: S, state: AppState) -> Result<()>
+async fn serve_utnp<S>(stream: S, state: AppState, secure_transport: bool) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(stream);
+
+    // USTS is enforced before parsing or processing any plaintext UTNP request.
+    // The specification requires an error response (when possible), then closure.
+    if state.require_secure && !secure_transport {
+        reader
+            .get_mut()
+            .write_all(b"UTNP/2.0 ERROR REQUIRE SECURE\n")
+            .await?;
+        reader.get_mut().flush().await?;
+        return Ok(());
+    }
     loop {
         let mut first = String::new();
         let n = reader.read_line(&mut first).await?;
@@ -560,7 +583,7 @@ impl Handler for SshHandler {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        session.channel_failure(channel)?;
+        session.channel_success(channel)?;
         Ok(())
     }
 
