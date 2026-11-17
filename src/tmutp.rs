@@ -390,6 +390,7 @@ where
             let n = stream.read(&mut chunk).await?;
 
             if n == 0 {
+                stream.shutdown().await?;
                 return Ok(());
             }
 

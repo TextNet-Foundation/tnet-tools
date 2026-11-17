@@ -1,3 +1,4 @@
+
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
@@ -64,7 +65,9 @@ struct ExploreNode {
 #[derive(Debug, Deserialize, Clone)]
 struct Protocol {
     name: String,
-    version: String,
+    version: Vec<String>,
+    #[serde(rename = "default-version")]
+    default_version: usize,
     host: String,
     port: u16,
     #[serde(default)]
@@ -90,15 +93,22 @@ struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
     let config_content = fs::read_to_string(&args.config)
         .with_context(|| format!("Cannot read config file: {}", args.config))?;
-    let config: Config = toml::from_str(&config_content).context("Invalid UTNP config")?;
+
+    let config: Config =
+        toml::from_str(&config_content).context("Invalid UTNP config")?;
+
+    // Validate protocol versions before initializing transports or listening.
+    validate_protocols(&config.protocols)?;
 
     let tls_acceptor = if config.security.enable_tls {
         Some(load_tls_acceptor(&config.security)?)
     } else {
         None
     };
+
     let ssh_config = if config.security.enable_ssh {
         Some(load_ssh_config(&config.security)?)
     } else {
@@ -106,9 +116,11 @@ async fn main() -> Result<()> {
     };
 
     let mut enabled_security = Vec::new();
+
     if tls_acceptor.is_some() {
         enabled_security.push("tls".to_string());
     }
+
     if ssh_config.is_some() {
         enabled_security.push("ssh".to_string());
     }
@@ -128,6 +140,7 @@ async fn main() -> Result<()> {
     };
 
     let listener = TcpListener::bind("0.0.0.0:34").await?;
+
     println!("UTNP server listening on port 34");
     println!("Loaded {} protocols", state.protocols.len());
     println!(
@@ -137,15 +150,18 @@ async fn main() -> Result<()> {
     println!("TLS enabled: {}", tls_acceptor.is_some());
     println!("SSH enabled: {}", ssh_config.is_some());
     println!("USTS (secure transport required): {}", state.require_secure);
+
     if ssh_config.is_some() {
         println!("SSH authentication: none (transport only)");
     }
 
     loop {
         let (stream, peer) = listener.accept().await?;
+
         let state = state.clone();
         let tls_acceptor = tls_acceptor.clone();
         let ssh_config = ssh_config.clone();
+
         tokio::spawn(async move {
             if let Err(error) = dispatch_connection(
                 stream,
@@ -162,49 +178,105 @@ async fn main() -> Result<()> {
     }
 }
 
+fn validate_protocols(protocols: &[Protocol]) -> Result<()> {
+    for protocol in protocols {
+        if protocol.name.trim().is_empty() {
+            return Err(anyhow!("Protocol name cannot be empty"));
+        }
+
+        if protocol.version.is_empty() {
+            return Err(anyhow!(
+                "Protocol '{}' has an empty version array",
+                protocol.name
+            ));
+        }
+
+        if protocol.version.iter().any(|version| version.trim().is_empty()) {
+            return Err(anyhow!(
+                "Protocol '{}' contains an empty version",
+                protocol.name
+            ));
+        }
+
+        for (index, version) in protocol.version.iter().enumerate() {
+            if protocol.version[..index].contains(version) {
+                return Err(anyhow!(
+                    "Protocol '{}' contains duplicate version '{}'",
+                    protocol.name,
+                    version
+                ));
+            }
+        }
+
+        if protocol.default_version == 0
+            || protocol.default_version > protocol.version.len()
+        {
+            return Err(anyhow!(
+                "Protocol '{}': default-version={} is out of range (valid range: 1..={})",
+                protocol.name,
+                protocol.default_version,
+                protocol.version.len()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor> {
     if security.tls_public_path.is_empty() || security.tls_private_path.is_empty() {
         return Err(anyhow!(
             "enable_tls=true requires tls_public_path and tls_private_path"
         ));
     }
+
     let cert_file = fs::File::open(&security.tls_public_path)
         .with_context(|| format!("Cannot open TLS certificate: {}", security.tls_public_path))?;
+
     let mut cert_reader = StdBufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<std::result::Result<_, _>>()?;
+
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader)
+            .collect::<std::result::Result<_, _>>()?;
+
     if certs.is_empty() {
         return Err(anyhow!("TLS certificate file contains no certificates"));
     }
 
     let key_file = fs::File::open(&security.tls_private_path)
         .with_context(|| format!("Cannot open TLS private key: {}", security.tls_private_path))?;
+
     let mut key_reader = StdBufReader::new(key_file);
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or_else(|| anyhow!("TLS private key file contains no supported private key"))?;
+
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| anyhow!("TLS private key file contains no supported private key"))?;
 
     let tls_config = TlsServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("TLS certificate and private key do not match or are invalid")?;
+
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
 fn load_ssh_config(security: &SecurityConfig) -> Result<Arc<russh::server::Config>> {
     let path = &security.ssh_host_key_path;
+
     let key = russh::keys::load_secret_key(path, None)
         .with_context(|| format!("Cannot load SSH host key: {path}"))?;
 
-    // SSH's "none" authentication is intentionally enabled: SSH supplies the
-    // encrypted, integrity-protected transport and the host key authenticates
-    // the server. UTNP itself has no user-authentication layer.
+    // SSH provides encrypted and integrity-protected transport.
+    // UTNP itself does not implement user authentication.
     let mut methods = russh::MethodSet::empty();
     methods.push(MethodKind::None);
+
     let config = russh::server::Config {
         methods,
         keys: vec![key],
         ..Default::default()
     };
+
     Ok(Arc::new(config))
 }
 
@@ -216,103 +288,149 @@ async fn dispatch_connection(
     ssh_config: Option<Arc<russh::server::Config>>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
+
     let transport = sniff_transport(&stream).await?;
+
     match transport.as_str() {
         "tls" => {
-            let acceptor = tls_acceptor.ok_or_else(|| anyhow!("TLS handshake received but TLS is disabled"))?;
+            let acceptor = tls_acceptor
+                .ok_or_else(|| anyhow!("TLS handshake received but TLS is disabled"))?;
+
             let tls = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 acceptor.accept(stream),
             )
             .await
             .context("TLS handshake timed out")??;
+
             serve_utnp(tls, state, true).await?;
         }
+
         "ssh" => {
-            let config = ssh_config.ok_or_else(|| anyhow!("SSH handshake received but SSH is disabled"))?;
-            // SSH provides the protected transport; USTS therefore permits UTNP frames here.
+            let config = ssh_config
+                .ok_or_else(|| anyhow!("SSH handshake received but SSH is disabled"))?;
+
             let handler = SshHandler {
                 state,
                 buffers: HashMap::new(),
             };
+
             let session = russh::server::run_stream(config, stream, handler).await?;
             session.await?;
         }
-        _ => serve_utnp(stream, state, false).await?,
+
+        _ => {
+            serve_utnp(stream, state, false).await?;
+        }
     }
+
     let _ = peer;
     Ok(())
 }
 
 async fn sniff_transport(stream: &TcpStream) -> Result<String> {
     let mut peek = [0u8; 8];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let n = stream.peek(&mut peek).await?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "client closed before sending data",
-                ));
+
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            loop {
+                let n = stream.peek(&mut peek).await?;
+
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "client closed before sending data",
+                    ));
+                }
+
+                if n >= 4 || (n >= 2 && peek[0] == 0x16) {
+                    return Ok(n);
+                }
+
+                tokio::task::yield_now().await;
             }
-            if n >= 4 || (n >= 2 && peek[0] == 0x16) {
-                return Ok(n);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .context("Timed out while identifying connection transport")??;
 
     if n >= 4 && &peek[..4] == b"SSH-" {
         return Ok("ssh".into());
     }
+
     if n >= 2 && peek[0] == 0x16 && peek[1] == 0x03 {
         return Ok("tls".into());
     }
+
     Ok("plain".into())
 }
 
-async fn serve_utnp<S>(stream: S, state: AppState, secure_transport: bool) -> Result<()>
+
+async fn serve_utnp<S>(
+    stream: S,
+    state: AppState,
+    secure_transport: bool,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(stream);
 
-    // USTS is enforced before parsing or processing any plaintext UTNP request.
-    // The specification requires an error response (when possible), then closure.
+    // USTS is enforced before parsing or processing plaintext requests.
     if state.require_secure && !secure_transport {
         reader
             .get_mut()
             .write_all(b"UTNP/2.0 ERROR REQUIRE SECURE\n")
             .await?;
+
         reader.get_mut().flush().await?;
+
+        // Gracefully close the transport.
+        reader.get_mut().shutdown().await?;
+
         return Ok(());
     }
+
     loop {
         let mut first = String::new();
         let n = reader.read_line(&mut first).await?;
+
         if n == 0 {
+            // Client finished sending requests.
+            // For TLS this sends close_notify.
+            reader.get_mut().shutdown().await?;
             return Ok(());
         }
+
         let first_line = first.trim_end_matches(['\r', '\n']);
         let legacy = first_line.starts_with("UTNP/1.0 ");
+
         let mut frame = first.into_bytes();
+
         if !legacy {
             loop {
                 let mut line = String::new();
                 let n = reader.read_line(&mut line).await?;
+
                 if n == 0 {
+                    // Incomplete request frame.
+                    reader.get_mut().shutdown().await?;
                     return Ok(());
                 }
+
                 let done = line == "\n" || line == "\r\n";
+
                 frame.extend_from_slice(line.as_bytes());
+
                 if done {
                     break;
                 }
             }
         }
+
         let response = process_request(&frame, &state);
+
         reader.get_mut().write_all(&response).await?;
         reader.get_mut().flush().await?;
     }
@@ -323,9 +441,16 @@ fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
         Ok(value) => value,
         Err(_) => return error_response("2.0", "Invalid request"),
     };
+
     let mut lines = text.lines();
-    let request_line = lines.next().unwrap_or("").trim_end_matches('\r');
+
+    let request_line = lines
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\r');
+
     let parts: Vec<&str> = request_line.split_whitespace().collect();
+
     if parts.is_empty() {
         return error_response("2.0", "Invalid request");
     }
@@ -338,14 +463,20 @@ fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
     };
 
     let mut headers: Vec<(String, String)> = Vec::new();
+
     if !legacy {
         for line in lines {
             let line = line.trim_end_matches('\r');
+
             if line.is_empty() {
                 break;
             }
+
             if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+                headers.push((
+                    name.trim().to_ascii_lowercase(),
+                    value.trim().to_string(),
+                ));
             } else {
                 return error_response(version, "Invalid header");
             }
@@ -355,14 +486,16 @@ fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
     if parts.len() < 2 {
         return error_response(version, "Invalid request");
     }
+
     match parts[1] {
         "LIST" if parts.len() == 2 => {
             if legacy {
                 available_v1(&state.protocols)
             } else {
-                available_v2(&state.protocols, state.support_first_version, &state.enabled_security)
+                available_v2(&state.protocols, &state.enabled_security)
             }
         }
+
         "NEGOTIATE" if parts.len() == 3 => {
             if legacy {
                 negotiate_v1(parts[2], &state.protocols)
@@ -372,28 +505,28 @@ fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
                     .filter(|(name, _)| name == "supported-versions")
                     .map(|(_, value)| value.as_str())
                     .collect();
-                if values.is_empty() {
-                    error_response(version, "Unsupported protocol version")
-                } else if values.len() != 1 {
+
+                if values.len() > 1 {
                     error_response(version, "Invalid request")
                 } else {
                     negotiate_v2(
                         parts[2],
-                        values[0],
+                        values.first().copied(),
                         &state.protocols,
-                        state.support_first_version,
                         &state.enabled_security,
                     )
                 }
             }
         }
-        "EXPLORE" if !legacy && parts.len() == 2 => explore_response(&state.explore_nodes),
+
+        "EXPLORE" if !legacy && parts.len() == 2 => {
+            explore_response(&state.explore_nodes)
+        }
+
         _ => error_response(version, "Invalid request"),
     }
 }
 
-// Build the unsupported-version response from the versions this server
-// actually accepts, rather than hardcoding UTNP/2.0.
 fn unsupported_utnp_version_response(state: &AppState) -> Vec<u8> {
     let mut supported = vec!["UTNP/2.0"];
 
@@ -414,24 +547,28 @@ fn error_response(version: &str, message: &str) -> Vec<u8> {
 
 fn version_rank(version: &str) -> (u32, u32) {
     let mut parts = version.split('.');
+
     (
         parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
         parts.next().and_then(|s| s.parse().ok()).unwrap_or(0),
     )
 }
 
-fn supported_protocol_versions(protocol: &Protocol, support_first_version: bool) -> Vec<String> {
-    let mut versions = vec![protocol.version.clone()];
-    if support_first_version && protocol.version == "2.0" {
-        versions.push("1.0".to_string());
-    }
-    versions
+fn default_protocol_version(protocol: &Protocol) -> &str {
+    &protocol.version[protocol.default_version - 1]
 }
 
-fn enabled_security_for_protocol(configured: &[String], enabled: &[String]) -> Vec<String> {
+fn enabled_security_for_protocol(
+    configured: &[String],
+    enabled: &[String],
+) -> Vec<String> {
     configured
         .iter()
-        .filter(|mechanism| enabled.iter().any(|value| value.eq_ignore_ascii_case(mechanism)))
+        .filter(|mechanism| {
+            enabled
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(mechanism))
+        })
         .cloned()
         .collect()
 }
@@ -444,112 +581,193 @@ fn append_security(output: &mut String, mechanisms: &[String]) {
 
 fn available_v1(protocols: &[Protocol]) -> Vec<u8> {
     let mut output = String::from("UTNP/1.0 AVAILABLE\n");
+
     for protocol in protocols {
-        output.push_str(&format!(
-            "{} 1.0 {} {}\n",
-            protocol.name, protocol.host, protocol.port
-        ));
+        for version in &protocol.version {
+            output.push_str(&format!(
+                "{} {} {} {}\n",
+                protocol.name,
+                version,
+                protocol.host,
+                protocol.port
+            ));
+        }
     }
+
     output.into_bytes()
 }
 
-fn available_v2(protocols: &[Protocol], support_first_version: bool, enabled: &[String]) -> Vec<u8> {
+fn available_v2(
+    protocols: &[Protocol],
+    enabled: &[String],
+) -> Vec<u8> {
     let mut output = String::from("UTNP/2.0 AVAILABLE\n");
+
     for protocol in protocols {
-        for version in supported_protocol_versions(protocol, support_first_version) {
+        for version in &protocol.version {
             output.push_str(&format!(
                 "{} {} {} {}\n",
-                protocol.name, version, protocol.host, protocol.port
+                protocol.name,
+                version,
+                protocol.host,
+                protocol.port
             ));
+
             append_security(
                 &mut output,
                 &enabled_security_for_protocol(&protocol.security, enabled),
             );
         }
     }
+
     output.into_bytes()
 }
 
-fn negotiate_v1(requested: &str, protocols: &[Protocol]) -> Vec<u8> {
+fn negotiate_v1(
+    requested: &str,
+    protocols: &[Protocol],
+) -> Vec<u8> {
     for name in requested.split(',').map(str::trim) {
-        if let Some(protocol) = protocols.iter().find(|protocol| protocol.name == name) {
+        if let Some(protocol) = protocols
+            .iter()
+            .find(|protocol| protocol.name == name)
+        {
             return format!(
-                "UTNP/1.0 START PROTOCOL {} 1.0 {} {}\n",
-                protocol.name, protocol.host, protocol.port
+                "UTNP/1.0 START PROTOCOL {} {} {} {}\n",
+                protocol.name,
+                default_protocol_version(protocol),
+                protocol.host,
+                protocol.port
             )
             .into_bytes();
         }
     }
-    let mut output = String::from("UTNP/1.0 ERROR Unsupported protocol\n");
-    output.push_str(std::str::from_utf8(&available_v1(protocols)).unwrap());
+
+    let mut output =
+        String::from("UTNP/1.0 ERROR Unsupported protocol\n");
+
+    output.push_str(
+        std::str::from_utf8(&available_v1(protocols)).unwrap()
+    );
+
     output.into_bytes()
 }
 
 fn negotiate_v2(
     requested: &str,
-    client_versions: &str,
+    client_versions: Option<&str>,
     protocols: &[Protocol],
-    support_first_version: bool,
     enabled: &[String],
 ) -> Vec<u8> {
     if requested.is_empty() || requested.contains(',') {
         return error_response("2.0", "Invalid request");
     }
-    let Some(protocol) = protocols.iter().find(|protocol| protocol.name == requested) else {
-        let mut output = b"UTNP/2.0 ERROR Unsupported protocol\n".to_vec();
-        output.extend_from_slice(&available_v2(protocols, support_first_version, enabled));
+
+    let Some(protocol) = protocols
+        .iter()
+        .find(|protocol| protocol.name == requested)
+    else {
+        let mut output =
+            b"UTNP/2.0 ERROR Unsupported protocol\n".to_vec();
+
+        output.extend_from_slice(&available_v2(protocols, enabled));
+
         return output;
     };
-    let server_versions = supported_protocol_versions(protocol, support_first_version);
-    let client: Vec<&str> = client_versions
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect();
-    let selected = server_versions
-        .iter()
-        .filter(|version| client.contains(&version.as_str()))
-        .max_by_key(|version| version_rank(version));
-    let Some(selected_version) = selected else {
-        return error_response("2.0", "Unsupported protocol version");
+
+    let selected_version = match client_versions {
+        // No Supported-Versions header: use the configured default.
+        None => default_protocol_version(protocol),
+
+        // Explicit version negotiation.
+        Some(client_versions) => {
+            if client_versions.trim().is_empty() {
+                return error_response("2.0", "Invalid request");
+            }
+
+            let client: Vec<&str> = client_versions
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect();
+
+            if client.is_empty() {
+                return error_response("2.0", "Invalid request");
+            }
+
+            let selected = protocol
+                .version
+                .iter()
+                .filter(|version| client.contains(&version.as_str()))
+                .max_by_key(|version| version_rank(version));
+
+            let Some(selected) = selected else {
+                return error_response(
+                    "2.0",
+                    "Unsupported protocol version",
+                );
+            };
+
+            selected.as_str()
+        }
     };
 
     let mut output = format!(
         "UTNP/2.0 START PROTOCOL {} {} {} {}\n",
-        protocol.name, selected_version, protocol.host, protocol.port
+        protocol.name,
+        selected_version,
+        protocol.host,
+        protocol.port
     );
+
     append_security(
         &mut output,
         &enabled_security_for_protocol(&protocol.security, enabled),
     );
+
     output.into_bytes()
 }
 
 fn explore_response(nodes: &[ExploreNode]) -> Vec<u8> {
     let mut output = String::from("UTNP/2.0 EXPLORE AVAILABLE\n");
+
     for node in nodes {
         output.push_str(&format!(
             "utnp {} {} {}\n",
-            node.version, node.host, node.description
+            node.version,
+            node.host,
+            node.description
         ));
     }
+
     output.into_bytes()
 }
 
 fn complete_frame_len(buffer: &[u8]) -> Option<usize> {
     let first_end = buffer.iter().position(|byte| *byte == b'\n')? + 1;
-    let first = std::str::from_utf8(&buffer[..first_end]).ok()?.trim();
+
+    let first = std::str::from_utf8(&buffer[..first_end])
+        .ok()?
+        .trim();
+
     if first.starts_with("UTNP/1.0 ") {
         return Some(first_end);
     }
+
     let mut position = first_end;
+
     loop {
-        let relative = buffer[position..].iter().position(|byte| *byte == b'\n')?;
+        let relative = buffer[position..]
+            .iter()
+            .position(|byte| *byte == b'\n')?;
+
         let end = position + relative + 1;
         let line = &buffer[position..end];
+
         if line == b"\n" || line == b"\r\n" {
             return Some(end);
         }
+
         position = end;
     }
 }
@@ -562,7 +780,10 @@ struct SshHandler {
 impl Handler for SshHandler {
     type Error = russh::Error;
 
-    async fn auth_none(&mut self, _user: &str) -> std::result::Result<Auth, Self::Error> {
+    async fn auth_none(
+        &mut self,
+        _user: &str,
+    ) -> std::result::Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
 
@@ -608,17 +829,23 @@ impl Handler for SshHandler {
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         let buffer = self.buffers.entry(channel).or_default();
+
         buffer.extend_from_slice(data);
+
         if buffer.len() > 1024 * 1024 {
             self.buffers.remove(&channel);
             session.close(channel)?;
             return Ok(());
         }
+
         while let Some(frame_len) = complete_frame_len(buffer) {
             let frame: Vec<u8> = buffer.drain(..frame_len).collect();
+
             let response = process_request(&frame, &self.state);
+
             session.data(channel, Bytes::from(response))?;
         }
+
         Ok(())
     }
 
