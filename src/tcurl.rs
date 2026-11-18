@@ -59,6 +59,10 @@ struct Args {
     #[arg(short = 't', long)]
     tcp: bool,
 
+    /// Ignore security mechanisms advertised by UTNP
+    #[arg(short = 'i', long = "ignore-utnp-security")]
+    ignore_utnp_security: bool,
+
     /// Add request header
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
@@ -112,7 +116,6 @@ impl Protocol {
             Self::Tbip => "TBIP/1.0",
         }
     }
-
 
     fn utnp_version(self) -> &'static str {
         match self {
@@ -486,6 +489,30 @@ fn build_request(
 // UTNP negotiation
 // -----------------------------------------------------------------------------
 
+fn parse_utnp_security(response: &str) -> Vec<String> {
+    response
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+
+            if !name.trim().eq_ignore_ascii_case("Security") {
+                return None;
+            }
+
+            Some(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_ascii_lowercase)
+                    .collect(),
+            )
+        })
+        .unwrap_or_default()
+}
+
 async fn negotiate_endpoint(
     target: &Target,
     utnp_port: u16,
@@ -549,6 +576,53 @@ async fn negotiate_endpoint(
 
     if host.is_empty() {
         bail!("UTNP returned an empty protocol host");
+    }
+
+    let supported_security = parse_utnp_security(&response_text);
+
+    let required_security: &[&str] = match mode {
+        TransportMode::TlsThenTcp => &["tls"],
+        TransportMode::SshThenTlsThenTcp => &["ssh", "tls"],
+        TransportMode::TcpOnly => &[],
+    };
+
+    let security_list = if supported_security.is_empty() {
+        "none".to_string()
+    } else {
+        supported_security.join(", ")
+    };
+
+    eprintln!("UTNP Security: {}", security_list);
+
+    if !required_security.is_empty() {
+        let security_supported = required_security.iter().any(|required| {
+            supported_security
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(required))
+        });
+
+        if !security_supported {
+            let required = required_security.join(" or ");
+
+            if !args.ignore_utnp_security {
+                bail!(
+                    "UTNP security mismatch: client requires {}, \
+                     but server supports: {}. \
+                     Use --ignore-utnp-security to override.",
+                    required,
+                    security_list
+                );
+            }
+
+            eprintln!(
+                "WARN: UTNP returned Security: {}",
+                security_list
+            );
+            eprintln!(
+                "WARN: --ignore-utnp-security is enabled; \
+                 attempting connection anyway."
+            );
+        }
     }
 
     eprintln!(
@@ -1143,7 +1217,9 @@ async fn handle_response(
         tokio::fs::write(path, body)
             .await
             .with_context(|| {
-                format!("Cannot save response body to {}", path.display())
+                format!("Cannot save response body to {}",
+                    path.display()
+                )
             })?;
     } else {
         let mut stdout = tokio::io::stdout();
