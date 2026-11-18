@@ -23,10 +23,13 @@ rustls-native-certs = "0.8"
 name = "utnp-server"
 path = "src/server.rs"
 
-
 [[bin]]
 name = "utnp-client"
 path = "src/client.rs"
+
+[[bin]]
+name = "tcurl"
+path = "src/tcurl.rs"
 
 [[bin]]
 name = "tmutp-server"
