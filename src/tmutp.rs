@@ -1,15 +1,17 @@
-
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader as StdBufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{
@@ -20,7 +22,7 @@ use tokio_rustls::TlsAcceptor;
 use url::form_urlencoded;
 
 mod script_engine;
-use script_engine::{ScriptEngine, Request, Response, ScriptingConfig};
+use script_engine::{Request, Response, ScriptingConfig, ScriptEngine};
 use script_engine::lua::LuaEngine;
 use script_engine::rhai::RhaiEngine;
 
@@ -88,15 +90,16 @@ struct AppState {
 // -----------------------------------------------------------------------------
 
 const OK: &str = "20 OK";
-#[allow(dead_code)]
 const OK_EMPTY: &str = "22 OK EMPTY";
 const BAD_REQUEST: &str = "30 BAD REQUEST";
 const NOT_FOUND: &str = "31 NOT FOUND";
 const FORBIDDEN: &str = "32 FORBIDDEN";
 const SERVER_ERROR: &str = "40 SERVER ERROR";
 const METHOD_NOT_ALLOWED: &str = "50 METHOD NOT ALLOWED";
-#[allow(dead_code)]
 const VERSION_NOT_SUPPORTED: &str = "51 VERSION NOT SUPPORTED";
+const INVALID_RANGE: &str = "52 INVALID RANGE";
+const RANGE_NOT_SATISFIABLE: &str = "53 RANGE NOT SATISFIABLE";
+const UNSUPPORTED_RANGE: &str = "54 UNSUPPORTED RANGE";
 const REQUIRE_SECURE: &str = "55 REQUIRE SECURE";
 
 const TMUTP_VERSION: &str = "TMUTP/2.0";
@@ -582,7 +585,6 @@ impl Handler for TmutpSshHandler {
 
 // -----------------------------------------------------------------------------
 // TMUTP request framing
-// A request ends after its header terminator and Content-Length bytes.
 // -----------------------------------------------------------------------------
 
 fn complete_request_len(buffer: &[u8]) -> Option<usize> {
@@ -617,7 +619,6 @@ fn complete_request_len(buffer: &[u8]) -> Option<usize> {
 
 // -----------------------------------------------------------------------------
 // TMUTP request processing
-// This function is shared by TCP, TLS and SSH.
 // -----------------------------------------------------------------------------
 
 fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
@@ -674,9 +675,7 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
 }
 
 fn replace_response_version(response: &mut Vec<u8>, version: &str) {
-    let header_end = response
-        .iter()
-        .position(|byte| *byte == b'\n');
+    let header_end = response.iter().position(|byte| *byte == b'\n');
 
     let Some(line_end) = header_end else {
         return;
@@ -701,7 +700,7 @@ fn make_version_error_response(version: &str, message: &str) -> Vec<u8> {
     );
 
     let header = format!(
-        "{} 51 VERSION NOT SUPPORTED\nContent-Length: {}\n\n",
+        "{} 51 VERSION NOT SUPPORTED\nContent-Type: text/tmkup\nContent-Length: {}\n\n",
         version,
         body.len()
     );
@@ -816,6 +815,9 @@ fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
             "POST request must include Content-Length header",
         );
     }
+
+    // Сохраняем Range до перемещения request_headers в Request.
+    let range_header = request_headers.get("range").cloned();
 
     let body_start = header_end;
     let body_end = match body_start.checked_add(content_length) {
@@ -937,11 +939,21 @@ fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
     match resolve_path(&state.root, &decoded_path) {
         Ok(Some(full_path)) => match fs::read(&full_path) {
             Ok(content) => {
-                if content.is_empty() {
-                    make_empty_response()
-                } else {
-                    make_response(OK, &content)
+                let modified = fs::metadata(&full_path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
+
+                if method == "GET" {
+                    if let Some(range_value) = range_header.as_deref() {
+                        return make_range_response(
+                            &content,
+                            modified,
+                            range_value,
+                        );
+                    }
                 }
+
+                make_file_response(&content, modified)
             }
 
             Err(error) => {
@@ -993,6 +1005,201 @@ fn find_header_end(raw: &[u8]) -> Option<usize> {
 }
 
 // -----------------------------------------------------------------------------
+// Range support
+// -----------------------------------------------------------------------------
+
+enum RangeParseResult {
+    Valid(usize, usize),
+    Invalid,
+    Unsupported,
+}
+
+fn parse_range(value: &str) -> RangeParseResult {
+    let Some((unit, range)) = value.trim().split_once('=') else {
+        return RangeParseResult::Invalid;
+    };
+
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return RangeParseResult::Unsupported;
+    }
+
+    let range = range.trim();
+
+    // TMUTP/2.0 currently supports exactly one bytes=start-end range.
+    if range.contains(',') {
+        return RangeParseResult::Unsupported;
+    }
+
+    let Some((start, end)) = range.split_once('-') else {
+        return RangeParseResult::Unsupported;
+    };
+
+    // Open-ended and suffix ranges are not supported by this form.
+    if start.is_empty() || end.is_empty() {
+        return RangeParseResult::Unsupported;
+    }
+
+    let start = match start.parse::<usize>() {
+        Ok(value) => value,
+        Err(_) => return RangeParseResult::Invalid,
+    };
+
+    let end = match end.parse::<usize>() {
+        Ok(value) => value,
+        Err(_) => return RangeParseResult::Invalid,
+    };
+
+    if start > end {
+        return RangeParseResult::Invalid;
+    }
+
+    RangeParseResult::Valid(start, end)
+}
+
+fn make_range_response(
+    content: &[u8],
+    modified: Option<SystemTime>,
+    range_header: &str,
+) -> Vec<u8> {
+    let source_length = content.len();
+
+    let (start, end) = match parse_range(range_header) {
+        RangeParseResult::Valid(start, end) => (start, end),
+
+        RangeParseResult::Invalid => {
+            return make_range_error_response(
+                INVALID_RANGE,
+                range_header,
+                "invalid-range",
+                source_length,
+            );
+        }
+
+        RangeParseResult::Unsupported => {
+            let reason = if range_header.contains(',') {
+                "multiple-ranges-not-supported"
+            } else {
+                "range-form-not-supported"
+            };
+
+            return make_range_error_response(
+                UNSUPPORTED_RANGE,
+                range_header,
+                reason,
+                source_length,
+            );
+        }
+    };
+
+    if start >= source_length || end >= source_length {
+        return make_range_error_response(
+            RANGE_NOT_SATISFIABLE,
+            range_header,
+            "outside-source",
+            source_length,
+        );
+    }
+
+    let range_content = &content[start..=end];
+
+    let hash = Sha256::digest(content);
+    let hash_hex = format!("{:x}", hash);
+
+    let mut header = format!(
+        "{} {}\n\
+         Content-Type: text/tmkup\n\
+         Content-Length: {}\n\
+         Content-Range: bytes {}-{}/{}\n\
+         FILE-SHA256: {}\n\
+         SOURCE-CONTENT-LENGTH: {}\n",
+        TMUTP_VERSION,
+        OK,
+        range_content.len(),
+        start,
+        end,
+        source_length,
+        hash_hex,
+        source_length,
+    );
+
+    if let Some(modified) = modified {
+        let date: DateTime<Utc> = modified.into();
+
+        header.push_str(&format!(
+            "Last-Modified: {}\n",
+            date.format("%Y-%m-%d")
+        ));
+    }
+
+    header.push('\n');
+
+    let mut response = header.into_bytes();
+    response.extend_from_slice(range_content);
+
+    response
+}
+
+fn make_range_error_response(
+    status: &str,
+    requested_range: &str,
+    reason: &str,
+    source_length: usize,
+) -> Vec<u8> {
+    let (title, heading, message) = match status {
+        INVALID_RANGE => (
+            "52 — Invalid Range",
+            "52 Invalid Range",
+            "The requested byte range is invalid.",
+        ),
+        RANGE_NOT_SATISFIABLE => (
+            "53 — Range Not Satisfiable",
+            "53 Range Not Satisfiable",
+            "The requested range is not available.",
+        ),
+        UNSUPPORTED_RANGE => (
+            "54 — Unsupported Range",
+            "54 Unsupported Range",
+            "The requested range form is not supported.",
+        ),
+        _ => (
+            "Range Error",
+            "Range Error",
+            "The requested byte range cannot be provided.",
+        ),
+    };
+
+    let body = format!(
+        "---tmk-meta\n\
+         title: \"{}\"\n\
+         ---tmk-meta\n\n\
+         # {}\n\n\
+         {}\n",
+        title,
+        heading,
+        message,
+    );
+
+    let header = format!(
+        "{} {}\n\
+         Content-Type: text/tmkup\n\
+         Content-Length: {}\n\
+         SOURCE-CONTENT-LENGTH: {}\n\
+         Range-Error: {}; {}\n\n",
+        TMUTP_VERSION,
+        status,
+        body.len(),
+        source_length,
+        requested_range,
+        reason,
+    );
+
+    let mut response = header.into_bytes();
+    response.extend_from_slice(body.as_bytes());
+
+    response
+}
+
+// -----------------------------------------------------------------------------
 // Response builders
 // -----------------------------------------------------------------------------
 
@@ -1006,9 +1213,18 @@ fn make_script_response(response: Response) -> Vec<u8> {
     );
 
     let mut output = status_line;
+    let mut has_content_type = false;
 
     for (key, value) in &response.headers {
+        if key.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
+        }
+
         output.push_str(&format!("{}: {}\n", key, value));
+    }
+
+    if !has_content_type {
+        output.push_str("Content-Type: text/tmkup\n");
     }
 
     let body = response.body.as_deref().unwrap_or(&[]);
@@ -1022,7 +1238,9 @@ fn make_script_response(response: Response) -> Vec<u8> {
 
 fn make_response(status: &str, body: &[u8]) -> Vec<u8> {
     let header = format!(
-        "{} {}\nContent-Length: {}\n\n",
+        "{} {}\n\
+         Content-Type: text/tmkup\n\
+         Content-Length: {}\n\n",
         TMUTP_VERSION,
         status,
         body.len()
@@ -1033,12 +1251,51 @@ fn make_response(status: &str, body: &[u8]) -> Vec<u8> {
     response
 }
 
+fn make_file_response(
+    content: &[u8],
+    modified: Option<SystemTime>,
+) -> Vec<u8> {
+    let status = if content.is_empty() {
+        OK_EMPTY
+    } else {
+        OK
+    };
+
+    let hash = Sha256::digest(content);
+    let hash_hex = format!("{:x}", hash);
+
+    let mut header = format!(
+        "{} {}\n\
+         Content-Type: text/tmkup\n\
+         Content-Length: {}\n\
+         FILE-SHA256: {}\n\
+         SOURCE-CONTENT-LENGTH: {}\n",
+        TMUTP_VERSION,
+        status,
+        content.len(),
+        hash_hex,
+        content.len(),
+    );
+
+    if let Some(modified) = modified {
+        let date: DateTime<Utc> = modified.into();
+
+        header.push_str(&format!(
+            "Last-Modified: {}\n",
+            date.format("%Y-%m-%d")
+        ));
+    }
+
+    header.push('\n');
+
+    let mut response = header.into_bytes();
+    response.extend_from_slice(content);
+
+    response
+}
+
 fn make_empty_response() -> Vec<u8> {
-    format!(
-        "{} 22 OK EMPTY\nContent-Length: 0\n\n",
-        TMUTP_VERSION
-    )
-    .into_bytes()
+    make_response(OK_EMPTY, &[])
 }
 
 fn make_error_response(
@@ -1047,7 +1304,12 @@ fn make_error_response(
     message: &str,
 ) -> Vec<u8> {
     let body = format!(
-        "---tmk-meta\ntitle: \"{}\"\n---tmk-meta\n\n# {}\n\n{}\n\n[Back to main](/index.tmkup)",
+        "---tmk-meta\n\
+         title: \"{}\"\n\
+         ---tmk-meta\n\n\
+         # {}\n\n\
+         {}\n\n\
+         [Back to main](/index.tmkup)",
         title,
         title,
         message
@@ -1074,7 +1336,10 @@ fn resolve_path(root: &str, path: &str) -> std::io::Result<Option<PathBuf>> {
     for component in PathBuf::from(&normalized_path).components() {
         match component {
             Component::Prefix(_) => {
-                return Err(Error::new(ErrorKind::PermissionDenied, "Path is outside root"));
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "Path is outside root",
+                ));
             }
             Component::RootDir | Component::CurDir => {}
             Component::Normal(part) => relative.push(part),
