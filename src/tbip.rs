@@ -82,7 +82,7 @@ struct AppState {
 // Protocol version
 // -----------------------------------------------------------------------------
 
-const TBIP_VERSION: &str = "TBIP/2.0";
+const TBIP_VERSION: &str = "TBIP/1.0";
 
 // -----------------------------------------------------------------------------
 // Status codes
@@ -584,7 +584,7 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
             return make_error_response(
                 VERSION_NOT_SUPPORTED,
                 "51 Version not supported",
-                "Server supports only TBIP/2.0",
+                "Server supports only TBIP/1.0",
             );
         }
     }

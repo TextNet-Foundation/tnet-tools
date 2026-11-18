@@ -93,7 +93,7 @@ const METHOD_NOT_ALLOWED: &str = "50 METHOD NOT ALLOWED";
 const VERSION_NOT_SUPPORTED: &str = "51 VERSION NOT SUPPORTED";
 const REQUIRE_SECURE: &str = "55 REQUIRE SECURE";
 
-const TMUTP_VERSION: &str = "TMUTP/2.0";
+const TMUTP_VERSION: &str = "TMUTP/1.0";
 
 fn status_code_to_text(code: u16) -> &'static str {
     match code {
@@ -650,7 +650,7 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
         return make_error_response(
             VERSION_NOT_SUPPORTED,
             "51 Version not supported",
-            "Server supports only TMUTP/2.0",
+            "Server supports only TMUTP/1.0",
         );
     }
 
