@@ -1,3 +1,4 @@
+
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
@@ -32,6 +33,9 @@ struct Config {
     port: u16,
     root: String,
     scripting: ScriptingConfig,
+
+    #[serde(default)]
+    support_first_version: bool,
 
     #[serde(default)]
     security: SecurityConfig,
@@ -76,6 +80,7 @@ struct AppState {
     rhai_engine: Option<Arc<RhaiEngine>>,
     scripting_config: ScriptingConfig,
     require_secure: bool,
+    support_first_version: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -90,10 +95,12 @@ const NOT_FOUND: &str = "31 NOT FOUND";
 const FORBIDDEN: &str = "32 FORBIDDEN";
 const SERVER_ERROR: &str = "40 SERVER ERROR";
 const METHOD_NOT_ALLOWED: &str = "50 METHOD NOT ALLOWED";
+#[allow(dead_code)]
 const VERSION_NOT_SUPPORTED: &str = "51 VERSION NOT SUPPORTED";
 const REQUIRE_SECURE: &str = "55 REQUIRE SECURE";
 
-const TMUTP_VERSION: &str = "TMUTP/1.0";
+const TMUTP_VERSION: &str = "TMUTP/2.0";
+const TMUTP_FIRST_VERSION: &str = "TMUTP/1.0";
 
 fn status_code_to_text(code: u16) -> &'static str {
     match code {
@@ -181,6 +188,7 @@ async fn main() -> Result<()> {
         rhai_engine,
         scripting_config: config.scripting.clone(),
         require_secure: config.security.require_secure,
+        support_first_version: config.support_first_version,
     };
 
     let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
@@ -188,6 +196,10 @@ async fn main() -> Result<()> {
     println!("TMUTP server listening on port {}", config.port);
     println!("Serving files from {}", config.root);
     println!("Protocol version: {}", TMUTP_VERSION);
+    println!(
+        "TMUTP/1.0 compatibility: {}",
+        state.support_first_version
+    );
     println!("TSTS (require_secure): {}", state.require_secure);
     println!("TLS enabled: {}", tls_acceptor.is_some());
     println!("SSH enabled: {}", ssh_config.is_some());
@@ -620,6 +632,97 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
         }
     };
 
+    let request_line = raw[..header_end]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+
+    let request_version = match std::str::from_utf8(request_line) {
+        Ok(line) => line.trim().split_whitespace().next(),
+        Err(_) => None,
+    };
+
+    let response_version = match request_version {
+        Some("TMUTP/2.0") => TMUTP_VERSION,
+        Some("TMUTP/1.0") if state.support_first_version => TMUTP_FIRST_VERSION,
+        Some("TMUTP/1.0") => {
+            return make_version_error_response(
+                TMUTP_VERSION,
+                "TMUTP/1.0 support is disabled on this server",
+            );
+        }
+        Some(_) => {
+            return make_version_error_response(
+                TMUTP_VERSION,
+                "Server supports TMUTP/2.0",
+            );
+        }
+        None => {
+            return make_error_response(
+                BAD_REQUEST,
+                "30 Bad request",
+                "Request line is missing or invalid",
+            );
+        }
+    };
+
+    let mut response = process_request_inner(raw, state);
+
+    replace_response_version(&mut response, response_version);
+
+    response
+}
+
+fn replace_response_version(response: &mut Vec<u8>, version: &str) {
+    let header_end = response
+        .iter()
+        .position(|byte| *byte == b'\n');
+
+    let Some(line_end) = header_end else {
+        return;
+    };
+
+    let first_line = &response[..line_end];
+
+    let Some(space_position) = first_line.iter().position(|byte| *byte == b' ') else {
+        return;
+    };
+
+    response.splice(
+        0..space_position,
+        version.as_bytes().iter().copied(),
+    );
+}
+
+fn make_version_error_response(version: &str, message: &str) -> Vec<u8> {
+    let body = format!(
+        "---tmk-meta\ntitle: \"51 Version not supported\"\n---tmk-meta\n\n# 51 Version not supported\n\n{}\n",
+        message
+    );
+
+    let header = format!(
+        "{} 51 VERSION NOT SUPPORTED\nContent-Length: {}\n\n",
+        version,
+        body.len()
+    );
+
+    let mut response = header.into_bytes();
+    response.extend_from_slice(body.as_bytes());
+    response
+}
+
+fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
+    let header_end = match find_header_end(raw) {
+        Some(end) => end,
+        None => {
+            return make_error_response(
+                BAD_REQUEST,
+                "30 Bad request",
+                "Request headers are incomplete",
+            );
+        }
+    };
+
     let header_text = String::from_utf8_lossy(&raw[..header_end]);
     let mut lines = header_text.lines();
 
@@ -635,24 +738,6 @@ fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
     };
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
-
-    // The version is checked before validating the rest of the request line.
-    // This ensures that "TMUTP/3.0 GET" receives 51, not 30.
-    if parts.is_empty() {
-        return make_error_response(
-            BAD_REQUEST,
-            "30 Bad request",
-            "Request line is missing",
-        );
-    }
-
-    if parts[0] != TMUTP_VERSION {
-        return make_error_response(
-            VERSION_NOT_SUPPORTED,
-            "51 Version not supported",
-            "Server supports only TMUTP/1.0",
-        );
-    }
 
     if parts.len() != 3 {
         return make_error_response(

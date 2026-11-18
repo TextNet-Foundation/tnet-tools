@@ -1,3 +1,4 @@
+
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
@@ -24,11 +25,7 @@ const MAX_RESPONSE_HEADER: usize = 64 * 1024;
 const MAX_RESPONSE_BODY: usize = 256 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "TextNet protocol client"
-)]
+#[command(author, version, about = "TextNet protocol client")]
 #[command(group(
     clap::ArgGroup::new("method")
         .args(["post", "head"])
@@ -50,6 +47,46 @@ struct Args {
     /// Use HEAD
     #[arg(long)]
     head: bool,
+
+    /// Use UTNP/1.0 for service negotiation
+    #[arg(long)]
+    uv1: bool,
+
+    /// Use TBIP/1.0 for binary transfers
+    #[arg(long)]
+    bv1: bool,
+
+    /// Use TMUTP/1.0 for document transfers
+    #[arg(long)]
+    tv1: bool,
+
+    /// Use version 1.0 of all protocols and force TCP only
+    #[arg(long)]
+    v1: bool,
+
+    /// Use SSH for UTNP negotiation
+    #[arg(long)]
+    us: bool,
+
+    /// Use SSH for TBIP
+    #[arg(long)]
+    bs: bool,
+
+    /// Use SSH for TMUTP
+    #[arg(long)]
+    ts: bool,
+
+    /// Use TCP only for UTNP negotiation
+    #[arg(long)]
+    utcp: bool,
+
+    /// Use TCP only for TBIP
+    #[arg(long)]
+    btcp: bool,
+
+    /// Use TCP only for TMUTP
+    #[arg(long)]
+    ttcp: bool,
 
     /// Try SSH, then TLS, then TCP
     #[arg(short = 's', long)]
@@ -110,18 +147,17 @@ impl Protocol {
         }
     }
 
-    fn version(self) -> &'static str {
-        match self {
-            Self::Tmutp => "TMUTP/1.0",
-            Self::Tbip => "TBIP/1.0",
+    fn version(self, v1: bool) -> &'static str {
+        match (self, v1) {
+            (Self::Tmutp, true) => "TMUTP/1.0",
+            (Self::Tmutp, false) => "TMUTP/2.0",
+            (Self::Tbip, true) => "TBIP/1.0",
+            (Self::Tbip, false) => "TBIP/2.0",
         }
     }
 
-    fn utnp_version(self) -> &'static str {
-        match self {
-            Self::Tmutp => "1.0",
-            Self::Tbip => "1.0",
-        }
+    fn version_number(v1: bool) -> &'static str {
+        if v1 { "1.0" } else { "2.0" }
     }
 }
 
@@ -147,6 +183,13 @@ enum TransportMode {
     TlsThenTcp,
     SshThenTlsThenTcp,
     TcpOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransportTarget {
+    Utnp,
+    Tmutp,
+    Tbip,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +226,46 @@ enum SshAttemptError {
     Failed(anyhow::Error),
 }
 
+/// Determines the transport independently for UTNP, TBIP and TMUTP.
+///
+/// Specific protocol flags override global -s / -t settings.
+fn transport_mode(args: &Args, target: TransportTarget) -> Result<TransportMode> {
+    let (specific_ssh, specific_tcp) = match target {
+        TransportTarget::Utnp => (args.us, args.utcp),
+        TransportTarget::Tmutp => (args.ts, args.ttcp),
+        TransportTarget::Tbip => (args.bs, args.btcp),
+    };
+
+    if specific_ssh && specific_tcp {
+        bail!("SSH and TCP cannot both be selected for the same protocol");
+    }
+
+    // Global legacy mode always forces TCP.
+    if args.v1 {
+        return Ok(TransportMode::TcpOnly);
+    }
+
+    // Protocol-specific settings have priority over global settings.
+    if specific_tcp {
+        return Ok(TransportMode::TcpOnly);
+    }
+
+    if specific_ssh {
+        return Ok(TransportMode::SshThenTlsThenTcp);
+    }
+
+    // Global settings are used when no specific setting exists.
+    if args.tcp {
+        return Ok(TransportMode::TcpOnly);
+    }
+
+    if args.ssh {
+        return Ok(TransportMode::SshThenTlsThenTcp);
+    }
+
+    Ok(TransportMode::TlsThenTcp)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -199,6 +282,21 @@ async fn main() -> Result<()> {
 
     if method == Method::Post && target.protocol != Protocol::Tmutp {
         bail!("POST is supported only by TMUTP");
+    }
+
+    if args.v1 && (args.ssh || args.us || args.bs || args.ts) {
+        bail!("SSH cannot be used with --v1; version 1.0 mode uses TCP only");
+    }
+
+    if args.v1 && args.ca_cert.is_some() {
+        bail!("--ca-cert cannot be used with --v1; version 1.0 mode uses TCP only");
+    }
+
+    if (args.us && args.utcp)
+        || (args.bs && args.btcp)
+        || (args.ts && args.ttcp)
+    {
+        bail!("SSH and TCP cannot both be selected for the same protocol");
     }
 
     if (args.data.is_some() || args.data_file.is_some())
@@ -218,12 +316,11 @@ async fn main() -> Result<()> {
         bail!("--output and --output-header must use different files");
     }
 
-    let mode = if args.tcp {
-        TransportMode::TcpOnly
-    } else if args.ssh {
-        TransportMode::SshThenTlsThenTcp
-    } else {
-        TransportMode::TlsThenTcp
+    let utnp_mode = transport_mode(&args, TransportTarget::Utnp)?;
+
+    let protocol_mode = match target.protocol {
+        Protocol::Tmutp => transport_mode(&args, TransportTarget::Tmutp)?,
+        Protocol::Tbip => transport_mode(&args, TransportTarget::Tbip)?,
     };
 
     let body = if let Some(data) = &args.data {
@@ -242,6 +339,7 @@ async fn main() -> Result<()> {
         &args.headers,
         &body,
         args.data.is_some(),
+        protocol_uses_v1(&target, &args),
     )?;
 
     let endpoint = if let Some(port) = target.direct_port {
@@ -262,7 +360,7 @@ async fn main() -> Result<()> {
         negotiate_endpoint(
             &target,
             utnp_port,
-            mode,
+            utnp_mode,
             &args,
         )
         .await?
@@ -282,7 +380,7 @@ async fn main() -> Result<()> {
         FrameKind::Protocol {
             head: method == Method::Head,
         },
-        mode,
+        protocol_mode,
         &args,
     )
     .await?;
@@ -404,6 +502,7 @@ fn build_request(
     custom_headers: &[String],
     body: &[u8],
     data_was_text: bool,
+    protocol_v1: bool,
 ) -> Result<Vec<u8>> {
     let mut headers = Vec::<(String, String)>::new();
 
@@ -468,7 +567,7 @@ fn build_request(
 
     let mut request = format!(
         "{} {} {}\n",
-        target.protocol.version(),
+        target.protocol.version(protocol_v1),
         method.as_str(),
         target.path_query
     );
@@ -488,6 +587,14 @@ fn build_request(
 // -----------------------------------------------------------------------------
 // UTNP negotiation
 // -----------------------------------------------------------------------------
+
+fn protocol_uses_v1(target: &Target, args: &Args) -> bool {
+    args.v1
+        || match target.protocol {
+            Protocol::Tmutp => args.tv1,
+            Protocol::Tbip => args.bv1,
+        }
+}
 
 fn parse_utnp_security(response: &str) -> Vec<String> {
     response
@@ -519,18 +626,34 @@ async fn negotiate_endpoint(
     mode: TransportMode,
     args: &Args,
 ) -> Result<Endpoint> {
-    let request = format!(
-        "UTNP/2.0 NEGOTIATE {}\nSupported-Versions: {}\n\n",
-        target.protocol.name(),
-        target.protocol.utnp_version()
-    );
+    let utnp_v1 = args.v1 || args.uv1;
+    let protocol_v1 = protocol_uses_v1(target, args);
+    let protocol_version = Protocol::version_number(protocol_v1);
+
+    let request = if utnp_v1 {
+        format!("UTNP/1.0 NEGOTIATE {}\n", target.protocol.name())
+    } else {
+        format!(
+            "UTNP/2.0 NEGOTIATE {}\nSupported-Versions: {}\n\n",
+            target.protocol.name(),
+            protocol_version
+        )
+    };
+
+    // UTNP/1.0 is TCP-only. This does not force the later protocol
+    // connection to TCP unless the global --v1 option was selected.
+    let negotiation_mode = if utnp_v1 {
+        TransportMode::TcpOnly
+    } else {
+        mode
+    };
 
     let response = exchange_with_fallback(
         &target.host,
         utnp_port,
         request.as_bytes(),
         FrameKind::Utnp,
-        mode,
+        negotiation_mode,
         args,
     )
     .await
@@ -543,9 +666,10 @@ async fn negotiate_endpoint(
         .ok_or_else(|| anyhow!("UTNP returned an empty response"))?;
 
     let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let expected_utnp_version = if utnp_v1 { "UTNP/1.0" } else { "UTNP/2.0" };
 
     if parts.len() != 7
-        || parts[0] != "UTNP/2.0"
+        || parts[0] != expected_utnp_version
         || parts[1] != "START"
         || parts[2] != "PROTOCOL"
     {
@@ -556,11 +680,11 @@ async fn negotiate_endpoint(
         bail!("UTNP returned an unexpected protocol: {}", parts[3]);
     }
 
-    if parts[4] != target.protocol.utnp_version() {
+    if parts[4] != protocol_version {
         bail!(
             "UTNP selected unsupported version {} (expected {})",
             parts[4],
-            target.protocol.utnp_version()
+            protocol_version
         );
     }
 
@@ -578,12 +702,20 @@ async fn negotiate_endpoint(
         bail!("UTNP returned an empty protocol host");
     }
 
-    let supported_security = parse_utnp_security(&response_text);
+    let supported_security = if utnp_v1 {
+        Vec::new()
+    } else {
+        parse_utnp_security(&response_text)
+    };
 
-    let required_security: &[&str] = match mode {
-        TransportMode::TlsThenTcp => &["tls"],
-        TransportMode::SshThenTlsThenTcp => &["ssh", "tls"],
-        TransportMode::TcpOnly => &[],
+    let required_security: &[&str] = if utnp_v1 {
+        &[]
+    } else {
+        match mode {
+            TransportMode::TlsThenTcp => &["tls"],
+            TransportMode::SshThenTlsThenTcp => &["ssh", "tls"],
+            TransportMode::TcpOnly => &[],
+        }
     };
 
     let security_list = if supported_security.is_empty() {
@@ -614,10 +746,7 @@ async fn negotiate_endpoint(
                 );
             }
 
-            eprintln!(
-                "WARN: UTNP returned Security: {}",
-                security_list
-            );
+            eprintln!("WARN: UTNP returned Security: {}", security_list);
             eprintln!(
                 "WARN: --ignore-utnp-security is enabled; \
                  attempting connection anyway."
@@ -628,7 +757,7 @@ async fn negotiate_endpoint(
     eprintln!(
         "UTNP selected {} {} at {}:{}",
         target.protocol.name(),
-        target.protocol.version(),
+        target.protocol.version(protocol_v1),
         host,
         port
     );
@@ -1217,7 +1346,8 @@ async fn handle_response(
         tokio::fs::write(path, body)
             .await
             .with_context(|| {
-                format!("Cannot save response body to {}",
+                format!(
+                    "Cannot save response body to {}",
                     path.display()
                 )
             })?;

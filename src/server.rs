@@ -20,6 +20,8 @@ use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, Deserialize)]
 struct Config {
+    #[serde(default = "default_server_port")]
+    port: u16,
     #[serde(default)]
     support_first_version: bool,
     protocols: Vec<Protocol>,
@@ -27,6 +29,10 @@ struct Config {
     explore: ExploreConfig,
     #[serde(default)]
     security: SecurityConfig,
+}
+
+fn default_server_port() -> u16 {
+    34
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -139,9 +145,9 @@ async fn main() -> Result<()> {
         require_secure: config.security.require_secure,
     };
 
-    let listener = TcpListener::bind("0.0.0.0:34").await?;
+    let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
 
-    println!("UTNP server listening on port 34");
+    println!("UTNP server listening on port {}", config.port);
     println!("Loaded {} protocols", state.protocols.len());
     println!(
         "UTNP/2.0 enabled; UTNP/1.0 compatibility: {}",
