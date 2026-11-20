@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader as StdBufReader;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,6 +42,20 @@ struct Config {
 
     #[serde(default)]
     security: SecurityConfig,
+
+    #[serde(default = "default_compression_minimum")]
+    compression_minimum: usize,
+
+    #[serde(default = "default_compression_cache")]
+    compression_cache: String,
+}
+
+fn default_compression_minimum() -> usize {
+    1024
+}
+
+fn default_compression_cache() -> String {
+    "./compression_cache".to_string()
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -83,6 +98,8 @@ struct AppState {
     scripting_config: ScriptingConfig,
     require_secure: bool,
     support_first_version: bool,
+    compression_minimum: usize,
+    compression_cache: PathBuf,
 }
 
 // -----------------------------------------------------------------------------
@@ -104,6 +121,10 @@ const REQUIRE_SECURE: &str = "55 REQUIRE SECURE";
 
 const TMUTP_VERSION: &str = "TMUTP/2.0";
 const TMUTP_FIRST_VERSION: &str = "TMUTP/1.0";
+
+/// Алгоритмы сжатия, которые сервер умеет применять.
+/// Порядок в списке не важен — выбор идёт по порядку клиента.
+const SUPPORTED_COMPRESSION: &[&str] = &["gzip", "zstd"];
 
 fn status_code_to_text(code: u16) -> &'static str {
     match code {
@@ -185,6 +206,13 @@ async fn main() -> Result<()> {
         None
     };
 
+    fs::create_dir_all(&config.compression_cache).with_context(|| {
+        format!(
+            "Cannot create compression cache directory: {}",
+            config.compression_cache
+        )
+    })?;
+
     let state = AppState {
         root: config.root.clone(),
         lua_engine,
@@ -192,6 +220,8 @@ async fn main() -> Result<()> {
         scripting_config: config.scripting.clone(),
         require_secure: config.security.require_secure,
         support_first_version: config.support_first_version,
+        compression_minimum: config.compression_minimum,
+        compression_cache: PathBuf::from(&config.compression_cache),
     };
 
     let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
@@ -206,6 +236,12 @@ async fn main() -> Result<()> {
     println!("TSTS (require_secure): {}", state.require_secure);
     println!("TLS enabled: {}", tls_acceptor.is_some());
     println!("SSH enabled: {}", ssh_config.is_some());
+    println!(
+        "Compression: {} (minimum {} bytes, cache {})",
+        SUPPORTED_COMPRESSION.join(", "),
+        state.compression_minimum,
+        state.compression_cache.display(),
+    );
 
     if config.scripting.enabled {
         println!(
@@ -234,6 +270,94 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+// -----------------------------------------------------------------------------
+// Compression helpers
+// -----------------------------------------------------------------------------
+
+/// Выбирает алгоритм сжатия по заголовку Accept-Compression.
+/// Приоритет — порядок клиента. Возвращает имя алгоритма или None.
+fn negotiate_compression(accept: Option<&str>) -> Option<&'static str> {
+    let value = accept?;
+
+    for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let alg = token.to_ascii_lowercase();
+
+        if let Some(&supported) = SUPPORTED_COMPRESSION
+            .iter()
+            .find(|&&s| s == alg)
+        {
+            return Some(supported);
+        }
+    }
+
+    None
+}
+
+/// Сжимает тело выбранным алгоритмом.
+/// Возвращает None, если тело пустое или сжатие не удалось.
+fn compress_body(body: &[u8], alg: &str) -> Option<Vec<u8>> {
+    if body.is_empty() {
+        return None;
+    }
+
+    match alg {
+        "gzip" => {
+            let mut encoder = flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            );
+            encoder.write_all(body).ok()?;
+            encoder.finish().ok()
+        }
+        "zstd" => {
+            let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).ok()?;
+            encoder.write_all(body).ok()?;
+            encoder.finish().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Путь к файлу кэша для (source_path, algorithm).
+fn cache_path(cache_dir: &Path, source_path: &Path, alg: &str) -> PathBuf {
+    let path_hash = Sha256::digest(source_path.to_string_lossy().as_bytes());
+    let hex = format!("{:x}", path_hash);
+    cache_dir.join(format!("{}.{}", hex, alg))
+}
+
+/// Возвращает сжатые данные из кэша или создаёт их.
+/// В файле кэша хранится [32 байта SHA-256 исходника][сжатые данные].
+/// Если хэш не совпадает — кэш удаляется и пересоздаётся.
+fn get_compressed_cached(
+    cache_dir: &Path,
+    source_path: &Path,
+    body: &[u8],
+    alg: &str,
+) -> Option<Vec<u8>> {
+    let cache_file = cache_path(cache_dir, source_path, alg);
+    let current_hash = Sha256::digest(body);
+
+    if let Ok(data) = fs::read(&cache_file) {
+        if data.len() >= 32 && data[..32] == current_hash[..] {
+            return Some(data[32..].to_vec());
+        }
+
+        // Кэш устарел — удаляем сразу.
+        let _ = fs::remove_file(&cache_file);
+    }
+
+    let compressed = compress_body(body, alg)?;
+
+    let mut cache_data = Vec::with_capacity(32 + compressed.len());
+    cache_data.extend_from_slice(&current_hash);
+    cache_data.extend_from_slice(&compressed);
+
+    // Ошибку записи кэша игнорируем — просто вернём сжатые данные.
+    let _ = fs::write(&cache_file, &cache_data);
+
+    Some(compressed)
 }
 
 // -----------------------------------------------------------------------------
@@ -819,6 +943,11 @@ fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
     // Сохраняем Range до перемещения request_headers в Request.
     let range_header = request_headers.get("range").cloned();
 
+    // Переговоры о сжатии.
+    let accept_compression_header = request_headers.get("accept-compression").cloned();
+    let accept_compression_present = accept_compression_header.is_some();
+    let compression = negotiate_compression(accept_compression_header.as_deref());
+
     let body_start = header_end;
     let body_end = match body_start.checked_add(content_length) {
         Some(end) => end,
@@ -899,7 +1028,12 @@ fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
                 if let Some(engine) = &state.lua_engine {
                     if engine.has_script(&script_path) {
                         return match engine.execute(&script_path, &request) {
-                            Ok(Some(response)) => make_script_response(response),
+                            Ok(Some(response)) => make_script_response(
+                                response,
+                                compression,
+                                state.compression_minimum,
+                                accept_compression_present,
+                            ),
                             Ok(None) => make_empty_response(),
                             Err(error) => {
                                 eprintln!("Lua script error: {}", error);
@@ -917,7 +1051,12 @@ fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
                 if let Some(engine) = &state.rhai_engine {
                     if engine.has_script(&script_path) {
                         return match engine.execute(&script_path, &request) {
-                            Ok(Some(response)) => make_script_response(response),
+                            Ok(Some(response)) => make_script_response(
+                                response,
+                                compression,
+                                state.compression_minimum,
+                                accept_compression_present,
+                            ),
                             Ok(None) => make_empty_response(),
                             Err(error) => {
                                 eprintln!("Rhai script error: {}", error);
@@ -949,11 +1088,22 @@ fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
                             &content,
                             modified,
                             range_value,
+                            compression,
+                            state.compression_minimum,
+                            accept_compression_present,
                         );
                     }
                 }
 
-                make_file_response(&content, modified)
+                make_file_response(
+                    &content,
+                    modified,
+                    compression,
+                    state.compression_minimum,
+                    &state.compression_cache,
+                    &full_path,
+                    accept_compression_present,
+                )
             }
 
             Err(error) => {
@@ -1060,6 +1210,9 @@ fn make_range_response(
     content: &[u8],
     modified: Option<SystemTime>,
     range_header: &str,
+    compression: Option<&str>,
+    compression_minimum: usize,
+    announce_compression: bool,
 ) -> Vec<u8> {
     let source_length = content.len();
 
@@ -1102,6 +1255,20 @@ fn make_range_response(
 
     let range_content = &content[start..=end];
 
+    // Сжатие range-фрагмента (без кэша — фрагменты разные).
+    let (body, content_encoding) = if let Some(alg) = compression {
+        if range_content.len() >= compression_minimum {
+            match compress_body(range_content, alg) {
+                Some(data) => (data, Some(alg)),
+                None => (range_content.to_vec(), None),
+            }
+        } else {
+            (range_content.to_vec(), None)
+        }
+    } else {
+        (range_content.to_vec(), None)
+    };
+
     let hash = Sha256::digest(content);
     let hash_hex = format!("{:x}", hash);
 
@@ -1114,13 +1281,24 @@ fn make_range_response(
          SOURCE-CONTENT-LENGTH: {}\n",
         TMUTP_VERSION,
         OK,
-        range_content.len(),
+        body.len(),
         start,
         end,
         source_length,
         hash_hex,
         source_length,
     );
+
+    if announce_compression {
+        header.push_str(&format!(
+            "Supported-Compression: {}\n",
+            SUPPORTED_COMPRESSION.join(", ")
+        ));
+    }
+
+    if let Some(alg) = content_encoding {
+        header.push_str(&format!("Content-Encoding: {}\n", alg));
+    }
 
     if let Some(modified) = modified {
         let date: DateTime<Utc> = modified.into();
@@ -1134,7 +1312,7 @@ fn make_range_response(
     header.push('\n');
 
     let mut response = header.into_bytes();
-    response.extend_from_slice(range_content);
+    response.extend_from_slice(&body);
 
     response
 }
@@ -1203,7 +1381,12 @@ fn make_range_error_response(
 // Response builders
 // -----------------------------------------------------------------------------
 
-fn make_script_response(response: Response) -> Vec<u8> {
+fn make_script_response(
+    response: Response,
+    compression: Option<&str>,
+    compression_minimum: usize,
+    announce_compression: bool,
+) -> Vec<u8> {
     let status_text = status_code_to_text(response.status);
     let status_line = format!(
         "{} {} {}\n",
@@ -1214,10 +1397,15 @@ fn make_script_response(response: Response) -> Vec<u8> {
 
     let mut output = status_line;
     let mut has_content_type = false;
+    let mut has_content_encoding = false;
 
     for (key, value) in &response.headers {
         if key.eq_ignore_ascii_case("content-type") {
             has_content_type = true;
+        }
+
+        if key.eq_ignore_ascii_case("content-encoding") {
+            has_content_encoding = true;
         }
 
         output.push_str(&format!("{}: {}\n", key, value));
@@ -1227,12 +1415,41 @@ fn make_script_response(response: Response) -> Vec<u8> {
         output.push_str("Content-Type: text/tmkup\n");
     }
 
-    let body = response.body.as_deref().unwrap_or(&[]);
+    if announce_compression {
+        output.push_str(&format!(
+            "Supported-Compression: {}\n",
+            SUPPORTED_COMPRESSION.join(", ")
+        ));
+    }
+
+    let original_body = response.body.as_deref().unwrap_or(&[]);
+
+    // Сжимаем только если скрипт сам не выставил Content-Encoding.
+    let (body, content_encoding) = if !has_content_encoding {
+        if let Some(alg) = compression {
+            if original_body.len() >= compression_minimum {
+                match compress_body(original_body, alg) {
+                    Some(data) => (data, Some(alg)),
+                    None => (original_body.to_vec(), None),
+                }
+            } else {
+                (original_body.to_vec(), None)
+            }
+        } else {
+            (original_body.to_vec(), None)
+        }
+    } else {
+        (original_body.to_vec(), None)
+    };
+
+    if let Some(alg) = content_encoding {
+        output.push_str(&format!("Content-Encoding: {}\n", alg));
+    }
 
     output.push_str(&format!("Content-Length: {}\n\n", body.len()));
 
     let mut bytes = output.into_bytes();
-    bytes.extend_from_slice(body);
+    bytes.extend_from_slice(&body);
     bytes
 }
 
@@ -1254,6 +1471,11 @@ fn make_response(status: &str, body: &[u8]) -> Vec<u8> {
 fn make_file_response(
     content: &[u8],
     modified: Option<SystemTime>,
+    compression: Option<&str>,
+    compression_minimum: usize,
+    cache_dir: &Path,
+    source_path: &Path,
+    announce_compression: bool,
 ) -> Vec<u8> {
     let status = if content.is_empty() {
         OK_EMPTY
@@ -1264,6 +1486,20 @@ fn make_file_response(
     let hash = Sha256::digest(content);
     let hash_hex = format!("{:x}", hash);
 
+    // Сжатие тела (с кэшем по пути исходного файла).
+    let (body, content_encoding) = if let Some(alg) = compression {
+        if content.len() >= compression_minimum {
+            match get_compressed_cached(cache_dir, source_path, content, alg) {
+                Some(data) => (data, Some(alg)),
+                None => (content.to_vec(), None),
+            }
+        } else {
+            (content.to_vec(), None)
+        }
+    } else {
+        (content.to_vec(), None)
+    };
+
     let mut header = format!(
         "{} {}\n\
          Content-Type: text/tmkup\n\
@@ -1272,10 +1508,21 @@ fn make_file_response(
          SOURCE-CONTENT-LENGTH: {}\n",
         TMUTP_VERSION,
         status,
-        content.len(),
+        body.len(),
         hash_hex,
         content.len(),
     );
+
+    if announce_compression {
+        header.push_str(&format!(
+            "Supported-Compression: {}\n",
+            SUPPORTED_COMPRESSION.join(", ")
+        ));
+    }
+
+    if let Some(alg) = content_encoding {
+        header.push_str(&format!("Content-Encoding: {}\n", alg));
+    }
 
     if let Some(modified) = modified {
         let date: DateTime<Utc> = modified.into();
@@ -1289,7 +1536,7 @@ fn make_file_response(
     header.push('\n');
 
     let mut response = header.into_bytes();
-    response.extend_from_slice(content);
+    response.extend_from_slice(&body);
 
     response
 }
