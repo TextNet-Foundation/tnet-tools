@@ -1100,45 +1100,45 @@ fn find_header_end(raw: &[u8]) -> Option<usize> {
 
 enum RangeParseResult {
     Valid(usize, usize),
-    Invalid,
-    Unsupported,
+    Invalid(&'static str),
+    Unsupported(&'static str),
 }
 
 fn parse_range(value: &str) -> RangeParseResult {
     let Some((unit, range)) = value.trim().split_once('=') else {
-        return RangeParseResult::Invalid;
+        return RangeParseResult::Invalid("malformed-range");
     };
 
     if !unit.trim().eq_ignore_ascii_case("bytes") {
-        return RangeParseResult::Unsupported;
+        return RangeParseResult::Unsupported("unsupported-range-unit");
     }
 
     let range = range.trim();
 
     if range.contains(',') {
-        return RangeParseResult::Unsupported;
+        return RangeParseResult::Unsupported("multiple-ranges-not-supported");
     }
 
     let Some((start, end)) = range.split_once('-') else {
-        return RangeParseResult::Unsupported;
+        return RangeParseResult::Unsupported("unsupported-range-form");
     };
 
     if start.is_empty() || end.is_empty() {
-        return RangeParseResult::Unsupported;
+        return RangeParseResult::Unsupported("unsupported-range-form");
     }
 
     let start = match start.parse::<usize>() {
         Ok(value) => value,
-        Err(_) => return RangeParseResult::Invalid,
+        Err(_) => return RangeParseResult::Invalid("malformed-range"),
     };
 
     let end = match end.parse::<usize>() {
         Ok(value) => value,
-        Err(_) => return RangeParseResult::Invalid,
+        Err(_) => return RangeParseResult::Invalid("malformed-range"),
     };
 
     if start > end {
-        return RangeParseResult::Invalid;
+        return RangeParseResult::Invalid("invalid-range-order");
     }
 
     RangeParseResult::Valid(start, end)
@@ -1252,30 +1252,36 @@ fn make_range_response(
     let (start, end) = match parse_range(range_header) {
         RangeParseResult::Valid(start, end) => (start, end),
 
-        RangeParseResult::Invalid => {
-            return make_error_response(
+        RangeParseResult::Invalid(reason) => {
+            return make_range_error_response(
                 INVALID_RANGE,
-                "52 Invalid range",
-                "The requested byte range is invalid",
+                reason,
+                range_header,
+                Some(source_length),
             );
         }
 
-        RangeParseResult::Unsupported => {
-            return make_error_response(
+        RangeParseResult::Unsupported(reason) => {
+            return make_range_error_response(
                 UNSUPPORTED_RANGE,
-                "54 Unsupported range",
-                "The requested range form is not supported",
+                reason,
+                range_header,
+                Some(source_length),
             );
         }
     };
 
-    if start >= source_length || end >= source_length {
-        return make_error_response(
+    if start >= source_length {
+        return make_range_error_response(
             RANGE_NOT_SATISFIABLE,
-            "53 Range not satisfiable",
-            "The requested range is not available",
+            "outside-source",
+            range_header,
+            Some(source_length),
         );
     }
+
+    // An end past the last byte is clamped to the end of the source.
+    let end = end.min(source_length - 1);
 
     let range_content = &content[start..=end];
 
@@ -1443,14 +1449,63 @@ fn make_empty_response() -> Vec<u8> {
 fn make_error_response(
     status: &str,
     _title: &str,
-    _message: &str,
+    message: &str,
 ) -> Vec<u8> {
-    format!(
-        "{} {}\nContent-Length: 0\n\n",
+    let body = format!("{}\n", message);
+
+    let mut response = format!(
+        "{} {}\nContent-Type: text/plain\nContent-Length: {}\n\n",
         TBIP_VERSION,
-        status
+        status,
+        body.len()
     )
-    .into_bytes()
+    .into_bytes();
+
+    response.extend_from_slice(body.as_bytes());
+    response
+}
+
+/// Error response for range-related failures (52/53/54).
+///
+/// Carries the requested range and the reason it could not be fulfilled in
+/// `Range-Error`, plus `SOURCE-CONTENT-LENGTH` when the source file is known.
+fn make_range_error_response(
+    status: &str,
+    reason: &str,
+    range_header: &str,
+    source_length: Option<usize>,
+) -> Vec<u8> {
+    let message = match status {
+        INVALID_RANGE => "The requested byte range is invalid.",
+        RANGE_NOT_SATISFIABLE => "The requested range is not available.",
+        UNSUPPORTED_RANGE => "The requested range form is not supported.",
+        _ => "The requested range cannot be fulfilled.",
+    };
+
+    let body = format!("{}\n", message);
+
+    let mut header = format!(
+        "{} {}\nContent-Type: text/plain\nContent-Length: {}\n",
+        TBIP_VERSION,
+        status,
+        body.len()
+    );
+
+    if let Some(length) = source_length {
+        header.push_str(&format!("SOURCE-CONTENT-LENGTH: {}\n", length));
+    }
+
+    header.push_str(&format!(
+        "Range-Error: {}; {}\n",
+        range_header.trim(),
+        reason
+    ));
+
+    header.push('\n');
+
+    let mut response = header.into_bytes();
+    response.extend_from_slice(body.as_bytes());
+    response
 }
 
 // -----------------------------------------------------------------------------
