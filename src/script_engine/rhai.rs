@@ -1,20 +1,13 @@
+use super::{Request, Response, ScriptEngine, resolve_existing_path, resolve_write_path};
+use rhai::{Dynamic, Engine, Map, Scope};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use rhai::{Engine, Scope, Map, Dynamic};
-use super::{
-    Request,
-    Response,
-    ScriptEngine,
-    resolve_existing_path,
-    resolve_write_path,
-};
 
-#[allow(dead_code)]
 pub struct RhaiEngine {
     root: PathBuf,
     extension: String,
-    hot_reload: bool,
+    _hot_reload: bool,
 }
 
 impl RhaiEngine {
@@ -22,7 +15,7 @@ impl RhaiEngine {
         Self {
             root: root.into(),
             extension: extension.unwrap_or_else(|| ".script.rhai".to_string()),
-            hot_reload,
+            _hot_reload: hot_reload,
         }
     }
 
@@ -48,7 +41,8 @@ impl RhaiEngine {
 
         resolve_existing_path(
             &self.root,
-            script_path.strip_prefix(&self.root)
+            script_path
+                .strip_prefix(&self.root)
                 .unwrap_or(&script_path)
                 .to_string_lossy()
                 .as_ref(),
@@ -68,7 +62,8 @@ impl ScriptEngine for RhaiEngine {
 
         let script_path = resolve_existing_path(
             &self.root,
-            script_path.strip_prefix(&self.root)
+            script_path
+                .strip_prefix(&self.root)
                 .unwrap_or(&script_path)
                 .to_string_lossy()
                 .as_ref(),
@@ -144,20 +139,21 @@ impl ScriptEngine for RhaiEngine {
         let root = self.root.clone();
 
         engine.register_fn("read_file", move |path: String| -> Result<String, String> {
-            let full = resolve_existing_path(&root, &path)
-                .map_err(|e| e.to_string())?;
+            let full = resolve_existing_path(&root, &path).map_err(|e| e.to_string())?;
 
             fs::read_to_string(&full).map_err(|e| e.to_string())
         });
 
         let root2 = self.root.clone();
 
-        engine.register_fn("write_file", move |(path, data): (String, String)| -> Result<(), String> {
-            let full = resolve_write_path(&root2, &path)
-                .map_err(|e| e.to_string())?;
+        engine.register_fn(
+            "write_file",
+            move |(path, data): (String, String)| -> Result<(), String> {
+                let full = resolve_write_path(&root2, &path).map_err(|e| e.to_string())?;
 
-            fs::write(&full, data).map_err(|e| e.to_string())
-        });
+                fs::write(&full, data).map_err(|e| e.to_string())
+            },
+        );
 
         let root3 = self.root.clone();
 
@@ -172,8 +168,7 @@ impl ScriptEngine for RhaiEngine {
         let root4 = self.root.clone();
 
         engine.register_fn("remove_file", move |path: String| -> Result<(), String> {
-            let full = resolve_existing_path(&root4, &path)
-                .map_err(|e| e.to_string())?;
+            let full = resolve_existing_path(&root4, &path).map_err(|e| e.to_string())?;
 
             fs::remove_file(&full).map_err(|e| e.to_string())
         });
@@ -182,7 +177,8 @@ impl ScriptEngine for RhaiEngine {
         engine.run_ast(&ast).map_err(|e| e.to_string())?;
 
         // Вызываем handle(request) с передачей req_map как аргумента
-        let result: Dynamic = engine.call_fn(&mut scope, &ast, "handle", (req_map,))
+        let result: Dynamic = engine
+            .call_fn(&mut scope, &ast, "handle", (req_map,))
             .map_err(|e| e.to_string())?;
 
         if result.is_unit() {
@@ -190,14 +186,13 @@ impl ScriptEngine for RhaiEngine {
         }
 
         let map = result.try_cast::<Map>().ok_or("Expected Map")?;
-        let status: u16 = map.get("status")
+        let status: u16 = map
+            .get("status")
             .and_then(|v| v.as_int().ok())
             .ok_or("Missing status")? as u16;
 
         let mut headers = HashMap::new();
-        if let Some(headers_map) = map.get("headers")
-            .and_then(|v| v.clone().try_cast::<Map>())
-        {
+        if let Some(headers_map) = map.get("headers").and_then(|v| v.clone().try_cast::<Map>()) {
             for (k, v) in headers_map.iter() {
                 if let Ok(s) = v.clone().into_string() {
                     headers.insert(k.to_string(), s);
@@ -205,10 +200,15 @@ impl ScriptEngine for RhaiEngine {
             }
         }
 
-        let body = map.get("body")
+        let body = map
+            .get("body")
             .and_then(|v| v.clone().into_string().ok())
             .map(|s| s.into_bytes());
 
-        Ok(Some(Response { status, headers, body }))
+        Ok(Some(Response {
+            status,
+            headers,
+            body,
+        }))
     }
 }

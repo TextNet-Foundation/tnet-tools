@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -66,7 +66,9 @@ pub fn resolve_existing_path(root: &Path, requested: &str) -> io::Result<PathBuf
     let relative_path = Path::new(relative);
 
     if relative_path.is_absolute()
-        || relative_path.components().any(|c| matches!(c, Component::Prefix(_)))
+        || relative_path
+            .components()
+            .any(|c| matches!(c, Component::Prefix(_)))
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
