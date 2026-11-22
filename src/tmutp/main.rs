@@ -11,5 +11,5 @@ mod script_engine;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    server::run().await
+	server::run().await
 }
