@@ -1,76 +1,7 @@
+use crate::common::compress_body;
+use crate::common::get_compressed_cached;
 use crate::config::{OK, OK_EMPTY, SUPPORTED_COMPRESSION, TMUTP_VERSION};
-use sha2::{Digest, Sha256};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
-pub fn negotiate_compression(accept: Option<&str>) -> Option<&'static str> {
-    let value = accept?;
-
-    for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        let alg = token.to_ascii_lowercase();
-
-        if let Some(&supported) = SUPPORTED_COMPRESSION.iter().find(|&&s| s == alg) {
-            return Some(supported);
-        }
-    }
-
-    None
-}
-
-pub fn compress_body(body: &[u8], alg: &str) -> Option<Vec<u8>> {
-    if body.is_empty() {
-        return None;
-    }
-
-    match alg {
-        "gzip" => {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(body).ok()?;
-            encoder.finish().ok()
-        }
-        "zstd" => {
-            let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).ok()?;
-            encoder.write_all(body).ok()?;
-            encoder.finish().ok()
-        }
-        _ => None,
-    }
-}
-
-pub fn cache_path(cache_dir: &Path, source_path: &Path, alg: &str) -> PathBuf {
-    let path_hash = Sha256::digest(source_path.to_string_lossy().as_bytes());
-    let hex = format!("{:x}", path_hash);
-    cache_dir.join(format!("{}.{}", hex, alg))
-}
-
-pub async fn get_compressed_cached(
-    cache_dir: &Path,
-    source_path: &Path,
-    body: &[u8],
-    alg: &str,
-) -> Option<Vec<u8>> {
-    let cache_file = cache_path(cache_dir, source_path, alg);
-    let current_hash = Sha256::digest(body);
-
-    if let Ok(data) = tokio::fs::read(&cache_file).await {
-        if data.len() >= 32 && data[..32] == current_hash[..] {
-            return Some(data[32..].to_vec());
-        }
-
-        let _ = tokio::fs::remove_file(&cache_file).await;
-    }
-
-    let compressed = compress_body(body, alg)?;
-
-    let mut cache_data = Vec::with_capacity(32 + compressed.len());
-    cache_data.extend_from_slice(&current_hash);
-    cache_data.extend_from_slice(&compressed);
-
-    let _ = tokio::fs::write(&cache_file, &cache_data).await;
-
-    Some(compressed)
-}
+use sha2::Digest;
 
 pub fn make_range_response(
     content: &[u8],
@@ -79,6 +10,7 @@ pub fn make_range_response(
     compression: Option<&str>,
     compression_minimum: usize,
     announce_compression: bool,
+    file_sha256_hex: Option<&str>,
 ) -> Vec<u8> {
     use crate::config::{
         INVALID_RANGE, OK, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION, TMUTP_VERSION,
@@ -139,8 +71,10 @@ pub fn make_range_response(
         (range_content.to_vec(), None)
     };
 
-    let hash = sha2::Sha256::digest(content);
-    let hash_hex = format!("{:x}", hash);
+    let hash_hex = match file_sha256_hex {
+        Some(hex) => hex.to_string(),
+        None => format!("{:x}", sha2::Sha256::digest(content)),
+    };
 
     let mut header = format!(
         "{} {}\n\
@@ -184,6 +118,7 @@ pub fn make_range_response(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn make_file_response(
     content: &[u8],
     modified: Option<std::time::SystemTime>,
@@ -192,15 +127,19 @@ pub async fn make_file_response(
     cache_dir: &std::path::Path,
     source_path: &std::path::Path,
     announce_compression: bool,
+    file_sha256_hex: Option<&str>,
 ) -> Vec<u8> {
     let status = if content.is_empty() { OK_EMPTY } else { OK };
 
-    let hash = sha2::Sha256::digest(content);
-    let hash_hex = format!("{:x}", hash);
+    let hash_hex = match file_sha256_hex {
+        Some(hex) => hex.to_string(),
+        None => format!("{:x}", sha2::Sha256::digest(content)),
+    };
 
     let (body, content_encoding) = if let Some(alg) = compression {
         if content.len() >= compression_minimum {
-            match get_compressed_cached(cache_dir, source_path, content, alg).await {
+            match get_compressed_cached(cache_dir, source_path, content, alg, true, u64::MAX).await
+            {
                 Some(data) => (data, Some(alg)),
                 None => (content.to_vec(), None),
             }

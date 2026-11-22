@@ -1,6 +1,7 @@
 use crate::args::Args;
 use crate::types::{Method, Protocol, Target};
 use anyhow::{Result, anyhow, bail};
+use std::fmt::Write;
 
 pub fn build_request(
     target: &Target,
@@ -10,7 +11,7 @@ pub fn build_request(
     data_was_text: bool,
     protocol_v1: bool,
 ) -> Result<Vec<u8>> {
-    let mut headers = Vec::<(String, String)>::new();
+    let mut headers = Vec::with_capacity(custom_headers.len() + 4);
 
     headers.push(("Host".to_string(), target.host.clone()));
     headers.push(("User-Agent".to_string(), "tcurl/0.1.0".to_string()));
@@ -62,15 +63,17 @@ pub fn build_request(
         headers.push(("Content-Length".to_string(), body.len().to_string()));
     }
 
-    let mut request = format!(
-        "{} {} {}\n",
+    let mut request = String::with_capacity(64);
+    let _ = writeln!(
+        request,
+        "{} {} {}",
         target.protocol.version(protocol_v1),
         method.as_str(),
         target.path_query
     );
 
     for (name, value) in headers {
-        request.push_str(&format!("{name}: {value}\n"));
+        let _ = writeln!(request, "{name}: {value}");
     }
 
     request.push('\n');

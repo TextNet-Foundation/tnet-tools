@@ -1,7 +1,9 @@
+#[path = "../common/mod.rs"]
+mod common;
+
 mod compression;
 mod config;
 mod handler;
-mod path;
 mod server;
 
 #[path = "../script_engine/mod.rs"]

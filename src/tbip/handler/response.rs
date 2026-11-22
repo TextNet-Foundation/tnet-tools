@@ -1,4 +1,5 @@
-use crate::compression::{get_cached_only, get_compressed_cached};
+use crate::common::get_compressed_cached;
+use crate::compression::get_cached_only;
 use crate::config::{
     AppState, OK, OK_EMPTY, SUPPORTED_COMPRESSION, TBIP_VERSION, VERSION_NOT_SUPPORTED,
 };
@@ -61,11 +62,11 @@ pub async fn make_file_response(
         if content.len() >= state.compression_minimum {
             match get_compressed_cached(
                 &state.compression_cache,
-                state.compression_cache_enable,
-                state.compression_cache_source_maximum,
                 source_path,
                 content,
                 alg,
+                state.compression_cache_enable,
+                state.compression_cache_source_maximum,
             )
             .await
             {

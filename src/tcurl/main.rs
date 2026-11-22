@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
 
     let endpoint = if let Some(port) = target.direct_port {
         types::Endpoint {
-            host: target.host.clone(),
+            host: target.host,
             port,
         }
     } else {

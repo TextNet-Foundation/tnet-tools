@@ -155,7 +155,8 @@ impl Handler for SshHandler {
         }
 
         while let Some(frame_len) = protocol::complete_frame_len(buffer) {
-            let frame: Vec<u8> = buffer.drain(..frame_len).collect();
+            let mut frame = Vec::with_capacity(frame_len);
+            frame.extend(buffer.drain(..frame_len));
 
             let response = protocol::process_request(&frame, &self.state);
 

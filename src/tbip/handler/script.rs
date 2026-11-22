@@ -150,7 +150,7 @@ pub fn make_script_response(
     state: &AppState,
     announce_compression: bool,
 ) -> Vec<u8> {
-    use crate::compression::compress_body;
+    use crate::common::compress_body;
     use crate::config::{SUPPORTED_COMPRESSION, TBIP_VERSION, status_code_to_text};
 
     let status_text = status_code_to_text(response.status);

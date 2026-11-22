@@ -19,10 +19,6 @@ pub async fn handle_accepted(
         Err(_) => return,
     };
 
-    let state = state.clone();
-    let tls_acceptor = tls_acceptor.clone();
-    let ssh_config = ssh_config.clone();
-
     tokio::spawn(async move {
         let _permit = permit;
         let result = timeout(

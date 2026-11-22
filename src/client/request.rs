@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use std::fmt::Write;
 
 pub fn build_request(command: &crate::cli::Command, legacy: bool) -> Result<String> {
     if legacy {
@@ -8,7 +9,9 @@ pub fn build_request(command: &crate::cli::Command, legacy: bool) -> Result<Stri
             crate::cli::Command::Negotiate { protocol, .. } => {
                 validate_protocol_name(protocol)?;
 
-                Ok(format!("UTNP/1.0 NEGOTIATE {}\n", protocol))
+                let mut output = String::with_capacity(32);
+                let _ = writeln!(output, "UTNP/1.0 NEGOTIATE {}", protocol);
+                Ok(output)
             }
 
             crate::cli::Command::Explore => {
@@ -31,13 +34,20 @@ pub fn build_request(command: &crate::cli::Command, legacy: bool) -> Result<Stri
                         bail!("Supported versions cannot be empty");
                     }
 
-                    Ok(format!(
+                    let mut output = String::with_capacity(64);
+                    let _ = write!(
+                        output,
                         "UTNP/2.0 NEGOTIATE {}\nSupported-Versions: {}\n\n",
                         protocol, versions
-                    ))
+                    );
+                    Ok(output)
                 }
 
-                None => Ok(format!("UTNP/2.0 NEGOTIATE {}\n\n", protocol)),
+                None => {
+                    let mut output = String::with_capacity(32);
+                    let _ = write!(output, "UTNP/2.0 NEGOTIATE {}\n\n", protocol);
+                    Ok(output)
+                }
             }
         }
     }

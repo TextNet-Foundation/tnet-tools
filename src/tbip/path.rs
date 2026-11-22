@@ -1,4 +1,3 @@
-use std::fs;
 use std::io;
 use std::path::{Component, PathBuf};
 
@@ -39,60 +38,6 @@ pub fn validate_relative_path(path: &str) -> io::Result<PathBuf> {
     Ok(relative)
 }
 
-pub fn resolve_path(root: &str, path: &str) -> io::Result<Option<PathBuf>> {
-    use std::io::{Error, ErrorKind};
-
-    let canonical_root = fs::canonicalize(root)?;
-
-    let relative = validate_relative_path(path)?;
-
-    if relative.as_os_str().is_empty() {
-        return Ok(None);
-    }
-
-    let mut current = canonical_root.clone();
-    let components: Vec<_> = relative.components().collect();
-
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(part) = component else {
-            continue;
-        };
-
-        current.push(part);
-
-        match fs::symlink_metadata(&current) {
-            Ok(_) => {
-                let canonical = fs::canonicalize(&current)?;
-
-                if !canonical.starts_with(&canonical_root) {
-                    return Err(Error::new(
-                        ErrorKind::PermissionDenied,
-                        "Path escapes document root through a symlink",
-                    ));
-                }
-
-                current = canonical;
-
-                if index + 1 < components.len() && !current.is_dir() {
-                    return Ok(None);
-                }
-            }
-
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(None);
-            }
-
-            Err(error) => return Err(error),
-        }
-    }
-
-    if current.is_file() {
-        Ok(Some(current))
-    } else {
-        Ok(None)
-    }
-}
-
 pub fn find_header_end(raw: &[u8]) -> Option<usize> {
     raw.windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -102,12 +47,6 @@ pub fn find_header_end(raw: &[u8]) -> Option<usize> {
                 .position(|window| window == b"\n\n")
                 .map(|position| position + 2)
         })
-}
-
-pub fn percent_decode(value: &str) -> String {
-    use percent_encoding::percent_decode_str;
-
-    percent_decode_str(value).decode_utf8_lossy().into_owned()
 }
 
 pub fn mime_type(path: &std::path::Path) -> &'static str {
@@ -173,9 +112,7 @@ pub fn mime_type(path: &std::path::Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
-
     fn temp_root(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tnet-tbip-test-{}", name));
         let _ = fs::remove_dir_all(&dir);
@@ -188,7 +125,7 @@ mod tests {
     #[test]
     fn resolve_path_blocks_traversal() {
         let root = temp_root("trav");
-        let r = resolve_path(root.to_str().unwrap(), "../../etc/passwd");
+        let r = crate::common::resolve_path(root.to_str().unwrap(), "../../etc/passwd");
         assert!(r.is_err() || r.unwrap().is_none());
         let _ = fs::remove_dir_all(&root);
     }
@@ -196,7 +133,7 @@ mod tests {
     #[test]
     fn resolve_path_serves_existing_file() {
         let root = temp_root("file");
-        let r = resolve_path(root.to_str().unwrap(), "hello.bin").unwrap();
+        let r = crate::common::resolve_path(root.to_str().unwrap(), "hello.bin").unwrap();
         assert!(r.is_some());
         let _ = fs::remove_dir_all(&root);
     }
@@ -204,7 +141,7 @@ mod tests {
     #[test]
     fn resolve_path_missing_returns_none() {
         let root = temp_root("missing");
-        let r = resolve_path(root.to_str().unwrap(), "nope.bin").unwrap();
+        let r = crate::common::resolve_path(root.to_str().unwrap(), "nope.bin").unwrap();
         assert!(r.is_none());
         let _ = fs::remove_dir_all(&root);
     }

@@ -34,7 +34,7 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    let mut enabled_security = Vec::new();
+    let mut enabled_security = Vec::with_capacity(2);
 
     if tls_acceptor.is_some() {
         enabled_security.push("tls".to_string());

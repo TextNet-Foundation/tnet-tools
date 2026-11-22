@@ -1,3 +1,4 @@
+use crate::common::{percent_decode, resolve_path};
 use crate::config::{
     AppState, BAD_REQUEST, FORBIDDEN, METHOD_NOT_ALLOWED, NOT_FOUND, SERVER_ERROR,
     TBIP_FIRST_VERSION, TBIP_VERSION,
@@ -7,7 +8,7 @@ use crate::handler::response::{
     make_version_error_response, replace_response_version,
 };
 use crate::handler::script::normalize_script_path;
-use crate::path::{percent_decode, resolve_path, validate_relative_path};
+use crate::path::validate_relative_path;
 use crate::script_engine::Request;
 use std::collections::HashMap;
 use std::io;
@@ -131,8 +132,7 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
     let range_header = request_headers.get("range").cloned();
     let accept_compression_header = request_headers.get("accept-compression").cloned();
     let accept_compression_present = accept_compression_header.is_some();
-    let compression =
-        crate::compression::negotiate_compression(accept_compression_header.as_deref());
+    let compression = crate::common::negotiate_compression(accept_compression_header.as_deref());
     let body_bytes = Vec::new();
     let form_params = HashMap::new();
     let script_path = normalize_script_path(&state.scripting_config, &decoded_path);
@@ -194,15 +194,13 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
     .await
     .unwrap_or_else(|_| Err(io::Error::other("join error")))
     {
-        Ok(Some(full_path)) => match tokio::fs::read(&full_path).await {
-            Ok(data) => {
-                let modified = tokio::fs::metadata(&full_path)
-                    .await
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok());
+        Ok(Some(full_path)) => match crate::common::read_file_cached(&full_path).await {
+            Ok(cached) => {
+                let data = &cached.bytes;
+                let modified = cached.modified;
                 if method == "HEAD" {
                     make_head_response(
-                        &data,
+                        data,
                         modified,
                         compression,
                         state,
@@ -212,7 +210,7 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
                     .await
                 } else if let Some(range_value) = range_header.as_deref() {
                     make_range_response(
-                        &data,
+                        data,
                         modified,
                         range_value,
                         compression,
@@ -222,7 +220,7 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
                     )
                 } else {
                     make_file_response(
-                        &data,
+                        data,
                         modified,
                         compression,
                         state,

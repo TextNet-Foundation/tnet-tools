@@ -5,6 +5,7 @@ pub use discovery::*;
 pub use frame::*;
 
 use crate::config::{AppState, Protocol};
+use std::fmt::Write;
 
 pub fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
     let text = match std::str::from_utf8(frame) {
@@ -90,21 +91,26 @@ pub fn process_request(frame: &[u8], state: &AppState) -> Vec<u8> {
 }
 
 pub fn unsupported_utnp_version_response(state: &AppState) -> Vec<u8> {
-    let mut supported = vec!["UTNP/2.0"];
+    let mut supported = Vec::with_capacity(2);
+    supported.push("UTNP/2.0");
 
     if state.support_first_version {
         supported.push("UTNP/1.0");
     }
 
-    format!(
-        "UTNP ERROR - UNSUPPORTED UTNP VERSION, SUPPORTED {}\n",
+    let mut output = String::with_capacity(64);
+    let _ = writeln!(
+        output,
+        "UTNP ERROR - UNSUPPORTED UTNP VERSION, SUPPORTED {}",
         supported.join(", ")
-    )
-    .into_bytes()
+    );
+    output.into_bytes()
 }
 
 pub fn error_response(version: &str, message: &str) -> Vec<u8> {
-    format!("UTNP/{version} ERROR {message}\n").into_bytes()
+    let mut output = String::with_capacity(version.len() + message.len() + 12);
+    let _ = writeln!(output, "UTNP/{version} ERROR {message}");
+    output.into_bytes()
 }
 
 pub fn version_rank(version: &str) -> (u32, u32) {
@@ -134,6 +140,6 @@ pub fn enabled_security_for_protocol(configured: &[String], enabled: &[String]) 
 
 pub fn append_security(output: &mut String, mechanisms: &[String]) {
     if !mechanisms.is_empty() {
-        output.push_str(&format!("Security: {}\n", mechanisms.join(",")));
+        let _ = writeln!(output, "Security: {}", mechanisms.join(","));
     }
 }

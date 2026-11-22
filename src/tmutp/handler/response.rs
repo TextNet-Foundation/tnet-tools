@@ -192,34 +192,34 @@ pub async fn serve_static_file(
     compression_cache: &Path,
     accept_compression_present: bool,
 ) -> Vec<u8> {
-    match tokio::fs::read(&full_path).await {
-        Ok(content) => {
-            let modified = tokio::fs::metadata(&full_path)
-                .await
-                .ok()
-                .and_then(|metadata| metadata.modified().ok());
+    match crate::common::read_file_cached(&full_path).await {
+        Ok(cached) => {
+            let content = &cached.bytes;
+            let modified = cached.modified;
 
             if method == "GET"
                 && let Some(range_value) = range_header
             {
                 return compression::make_range_response(
-                    &content,
+                    content,
                     modified,
                     range_value,
                     compression,
                     compression_minimum,
                     accept_compression_present,
+                    Some(cached.sha256_hex.as_str()),
                 );
             }
 
             compression::make_file_response(
-                &content,
+                content,
                 modified,
                 compression,
                 compression_minimum,
                 compression_cache,
                 &full_path,
                 accept_compression_present,
+                Some(cached.sha256_hex.as_str()),
             )
             .await
         }

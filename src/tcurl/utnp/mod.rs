@@ -2,6 +2,7 @@ use crate::args::Args;
 use crate::transport::exchange_with_fallback;
 use crate::types::{Endpoint, Target, TransportMode};
 use anyhow::{Context, Result, anyhow, bail};
+use std::fmt::Write;
 
 pub fn parse_utnp_security(response: &str) -> Vec<String> {
     response
@@ -38,13 +39,18 @@ pub async fn negotiate_endpoint(
     let protocol_version = crate::types::Protocol::version_number(protocol_v1);
 
     let request = if utnp_v1 {
-        format!("UTNP/1.0 NEGOTIATE {}\n", target.protocol.name())
+        let mut output = String::with_capacity(32);
+        let _ = writeln!(output, "UTNP/1.0 NEGOTIATE {}", target.protocol.name());
+        output
     } else {
-        format!(
+        let mut output = String::with_capacity(64);
+        let _ = write!(
+            output,
             "UTNP/2.0 NEGOTIATE {}\nSupported-Versions: {}\n\n",
             target.protocol.name(),
             protocol_version
-        )
+        );
+        output
     };
 
     // UTNP/1.0 is TCP-only. This does not force the later protocol

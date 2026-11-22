@@ -1,3 +1,4 @@
+use crate::common::{cache_path, compress_body};
 use crate::config::{
     AppState, INVALID_RANGE, OK, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION, TBIP_VERSION,
     UNSUPPORTED_RANGE,
@@ -5,43 +6,8 @@ use crate::config::{
 use crate::path::mime_type;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
-pub fn negotiate_compression(accept: Option<&str>) -> Option<&'static str> {
-    let value = accept?;
-    for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        let alg = token.to_ascii_lowercase();
-        if let Some(&supported) = SUPPORTED_COMPRESSION.iter().find(|&&s| s == alg) {
-            return Some(supported);
-        }
-    }
-    None
-}
-pub fn compress_body(body: &[u8], alg: &str) -> Option<Vec<u8>> {
-    use std::io::Write;
-    if body.is_empty() {
-        return None;
-    }
-    match alg {
-        "gzip" => {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(body).ok()?;
-            encoder.finish().ok()
-        }
-        "zstd" => {
-            let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).ok()?;
-            encoder.write_all(body).ok()?;
-            encoder.finish().ok()
-        }
-        _ => None,
-    }
-}
-pub fn cache_path(cache_dir: &Path, source_path: &Path, alg: &str) -> PathBuf {
-    let path_hash = Sha256::digest(source_path.to_string_lossy().as_bytes());
-    let hex = format!("{:x}", path_hash);
-    cache_dir.join(format!("{}.{}", hex, alg))
-}
 pub async fn get_cached_only(
     cache_dir: &Path,
     source_path: &Path,
@@ -57,32 +23,6 @@ pub async fn get_cached_only(
         return Some(data[32..].to_vec());
     }
     None
-}
-pub async fn get_compressed_cached(
-    cache_dir: &Path,
-    cache_enable: bool,
-    source_maximum: u64,
-    source_path: &Path,
-    body: &[u8],
-    alg: &str,
-) -> Option<Vec<u8>> {
-    let current_hash = Sha256::digest(body);
-    let can_cache = cache_enable && (body.len() as u64) <= source_maximum;
-    let cache_file = cache_path(cache_dir, source_path, alg);
-    if can_cache && let Ok(data) = tokio::fs::read(&cache_file).await {
-        if data.len() >= 32 && data[..32] == current_hash[..] {
-            return Some(data[32..].to_vec());
-        }
-        let _ = tokio::fs::remove_file(&cache_file).await;
-    }
-    let compressed = compress_body(body, alg)?;
-    if can_cache {
-        let mut cache_data = Vec::with_capacity(32 + compressed.len());
-        cache_data.extend_from_slice(&current_hash);
-        cache_data.extend_from_slice(&compressed);
-        let _ = tokio::fs::write(&cache_file, &cache_data).await;
-    }
-    Some(compressed)
 }
 // -----------------------------------------------------------------------------
 // Range support (moved here to keep response.rs under 300 lines)

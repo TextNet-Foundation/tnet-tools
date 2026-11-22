@@ -1,7 +1,7 @@
-use crate::compression::negotiate_compression;
+use crate::common::negotiate_compression;
+use crate::common::{percent_decode, resolve_path};
 use crate::config::*;
 use crate::handler::response::*;
-use crate::path::{percent_decode, resolve_path};
 use crate::script_engine::Request;
 use std::collections::HashMap;
 use std::io;

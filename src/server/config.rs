@@ -106,7 +106,12 @@ pub fn validate_protocols(protocols: &[Protocol]) -> Result<()> {
         }
 
         for (index, version) in protocol.version.iter().enumerate() {
-            if protocol.version[..index].contains(version) {
+            if protocol
+                .version
+                .iter()
+                .take(index)
+                .any(|existing| existing == version)
+            {
                 return Err(anyhow!(
                     "Protocol '{}' contains duplicate version '{}'",
                     protocol.name,

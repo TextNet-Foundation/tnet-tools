@@ -1,5 +1,6 @@
 use crate::types::{Protocol, Target};
 use anyhow::{Context, Result, anyhow, bail};
+use std::fmt::Write;
 use url::Url;
 
 pub fn parse_target(input: &str) -> Result<Target> {
@@ -84,7 +85,10 @@ pub fn normalize_u_port(input: &str) -> Result<(String, Option<u16>)> {
         bail!("UTNP port cannot be zero");
     }
 
-    let normalized = format!("{scheme}://{host_part}:{port}{suffix}");
+    let mut normalized = String::with_capacity(
+        scheme.len() + host_part.len() + suffix.len() + port.to_string().len() + 3,
+    );
+    let _ = write!(normalized, "{scheme}://{host_part}:{port}{suffix}");
 
     Ok((normalized, Some(port)))
 }

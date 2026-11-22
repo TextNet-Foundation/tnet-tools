@@ -1,4 +1,4 @@
-use crate::compression::compress_body;
+use crate::common::compress_body;
 use crate::config::*;
 use crate::script_engine::{Request, Response, ScriptEngine};
 use std::sync::Arc;
