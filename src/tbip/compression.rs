@@ -4,7 +4,6 @@ use crate::config::{
 	UNSUPPORTED_RANGE,
 };
 use crate::path::mime_type;
-use chrono::{DateTime, Utc};
 use std::fmt::Write;
 use std::time::SystemTime;
 
@@ -124,8 +123,11 @@ pub fn make_range_response(
 	let _ = writeln!(header, "SOURCE-CONTENT-LENGTH: {}", source_length);
 	header.push_str("Accept-Ranges: bytes\n");
 	if let Some(modified) = modified {
-		let date: DateTime<Utc> = modified.into();
-		let _ = writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d"));
+		let _ = writeln!(
+			header,
+			"Last-Modified: {}",
+			crate::common::date::format_ymd(modified)
+		);
 	}
 	if announce_compression {
 		let _ = writeln!(

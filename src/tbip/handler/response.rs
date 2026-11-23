@@ -4,7 +4,6 @@ use crate::config::{
 };
 use crate::path::mime_type;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use std::fmt::Write;
 use std::path::Path;
 use std::time::SystemTime;
@@ -23,8 +22,11 @@ pub fn append_file_metadata(
 	header.push_str("Accept-Ranges: bytes\n");
 
 	if let Some(modified) = modified {
-		let date: DateTime<Utc> = modified.into();
-		let _ = writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d"));
+		let _ = writeln!(
+			header,
+			"Last-Modified: {}",
+			crate::common::date::format_ymd(modified)
+		);
 	}
 }
 

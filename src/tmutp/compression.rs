@@ -31,8 +31,11 @@ fn append_trailer(
 	}
 
 	if let Some(modified) = modified {
-		let date: chrono::DateTime<chrono::Utc> = modified.into();
-		let _ = writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d"));
+		let _ = writeln!(
+			header,
+			"Last-Modified: {}",
+			crate::common::date::format_ymd(modified)
+		);
 	}
 
 	header.push('\n');

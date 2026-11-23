@@ -1,13 +1,12 @@
 use crate::config::SecurityConfig;
 use crate::conn::harden_ssh_config;
 use anyhow::{Context, Result, anyhow};
-use std::io::Cursor;
 use std::sync::Arc;
 use tokio::fs;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{
 	ServerConfig as TlsServerConfig,
-	pki_types::{CertificateDer, PrivateKeyDer},
+	pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 
 pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor> {
@@ -21,10 +20,8 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 		.await
 		.with_context(|| format!("cannot open TLS certificate: {}", security.tls_public_path))?;
 
-	let mut cert_reader = Cursor::new(cert_bytes);
-
 	let certs: Vec<CertificateDer<'static>> =
-		rustls_pemfile::certs(&mut cert_reader).collect::<std::result::Result<_, _>>()?;
+		CertificateDer::pem_slice_iter(&cert_bytes).collect::<std::result::Result<_, _>>()?;
 
 	if certs.is_empty() {
 		return Err(anyhow!("TLS certificate file contains no certificates"));
@@ -36,10 +33,8 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 		.await
 		.with_context(|| format!("cannot open TLS private key: {}", security.tls_private_path))?;
 
-	let mut key_reader = Cursor::new(key_bytes);
-
-	let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)?
-		.ok_or_else(|| anyhow!("TLS private key file contains no supported private key"))?;
+	let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+		.map_err(|e| anyhow!("TLS private key file contains no supported private key: {e}"))?;
 
 	let tls_config = TlsServerConfig::builder()
 		.with_no_client_auth()

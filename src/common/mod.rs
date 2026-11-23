@@ -1,6 +1,7 @@
 pub mod cache_util;
 pub mod compression;
 pub mod conn;
+pub mod date;
 pub mod file_cache;
 pub mod frame;
 pub mod path;

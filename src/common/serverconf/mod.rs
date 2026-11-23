@@ -12,13 +12,12 @@ use super::compression::{DiskCachePolicy, configure_disk_cache};
 use super::file_cache::configure_file_cache;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{
 	ServerConfig as TlsServerConfig,
-	pki_types::{CertificateDer, PrivateKeyDer},
+	pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 
 #[derive(Debug, Deserialize, Clone)]
@@ -132,8 +131,8 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 		.await
 		.with_context(|| format!("Cannot read TLS certificate: {}", security.tls_public_path))?;
 
-	let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut Cursor::new(cert_bytes))
-		.collect::<std::result::Result<_, _>>()?;
+	let certs: Vec<CertificateDer<'static>> =
+		CertificateDer::pem_slice_iter(&cert_bytes).collect::<std::result::Result<_, _>>()?;
 
 	if certs.is_empty() {
 		return Err(anyhow!("TLS certificate file contains no certificates"));
@@ -145,8 +144,8 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 		.await
 		.with_context(|| format!("Cannot read TLS private key: {}", security.tls_private_path))?;
 
-	let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut Cursor::new(key_bytes))?
-		.ok_or_else(|| anyhow!("TLS private key file contains no supported key"))?;
+	let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+		.map_err(|e| anyhow!("TLS private key file contains no supported key: {e}"))?;
 
 	let tls_config = TlsServerConfig::builder()
 		.with_no_client_auth()

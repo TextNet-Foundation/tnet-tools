@@ -17,11 +17,9 @@ mlua = { version = "0.9", features = ["lua54", "send"] }
 rhai = "1.19"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26.6"
-rustls-pemfile = "2"
 russh = { version = "0.65.2", default-features = false, features = ["ring", "flate2", "rsa"] }
 rustls-native-certs = "0.8"
 sha2 = "0.10"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flate2 = "1"
 lru = "0.19"
 zstd = "0.13"
