@@ -13,7 +13,7 @@ A collection of Rust tools for the TNet text network: three TCP servers (UTNP, T
 
 ## Requirements
 
-- Rust 1.70+
+- Rust 1.89+ (edition 2024; required by `russh`)
 - No external runtime dependencies (Lua is bundled via `mlua`)
 
 ## Build
@@ -202,4 +202,4 @@ tnet-tools/
 
 ## License
 
-GNU GPL v3.0
+GNU General Public License v3.0 or later (GPL-3.0-or-later)

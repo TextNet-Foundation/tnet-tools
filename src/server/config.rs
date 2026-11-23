@@ -1,12 +1,23 @@
+use crate::conn::ServerLimits;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use serde::Deserialize;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
 	#[serde(default = "default_server_port")]
 	pub port: u16,
+	#[serde(default = "default_bind_address")]
+	pub bind_address: String,
+	#[serde(default = "default_max_connections")]
+	pub max_connections: usize,
+	#[serde(default = "default_max_connections_per_ip")]
+	pub max_connections_per_ip: usize,
+	/// Общий максимум жизни соединения в секундах.
+	#[serde(default = "default_max_connection_secs")]
+	pub max_connection_secs: u64,
 	#[serde(default)]
 	pub support_first_version: bool,
 	pub protocols: Vec<Protocol>,
@@ -20,7 +31,24 @@ fn default_server_port() -> u16 {
 	34
 }
 
+fn default_bind_address() -> String {
+	"127.0.0.1".to_string()
+}
+
+fn default_max_connections() -> usize {
+	ServerLimits::default().max_connections
+}
+
+fn default_max_connections_per_ip() -> usize {
+	ServerLimits::default().max_per_ip
+}
+
+fn default_max_connection_secs() -> u64 {
+	ServerLimits::default().max_connection.as_secs()
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
 	#[serde(default)]
 	pub require_secure: bool,
@@ -34,6 +62,9 @@ pub struct SecurityConfig {
 	pub tls_private_path: String,
 	#[serde(default = "default_ssh_host_key_path")]
 	pub ssh_host_key_path: String,
+	/// Ошибка (а не предупреждение), если приватный ключ доступен группе/всем.
+	#[serde(default)]
+	pub strict_key_permissions: bool,
 }
 
 fn default_ssh_host_key_path() -> String {
@@ -41,12 +72,14 @@ fn default_ssh_host_key_path() -> String {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ExploreConfig {
 	#[serde(default)]
 	pub nodes: Vec<ExploreNode>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ExploreNode {
 	pub version: String,
 	pub host: String,
@@ -54,6 +87,7 @@ pub struct ExploreNode {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Protocol {
 	pub name: String,
 	pub version: Vec<String>,

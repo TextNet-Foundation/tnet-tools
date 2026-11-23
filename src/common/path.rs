@@ -1,138 +1,240 @@
+//! Single source of truth for request path handling.
+//!
+//! Pipeline: `normalize_request_path` (percent-decode once, reject NUL and
+//! invalid UTF-8, `\` is a separator, collapse `.`/`..`, no escape above root)
+//! produces the canonical request path. Every consumer (script lookup, static
+//! files, `Request.path` seen by scripts) must use that string only.
+//! `resolve_path` then maps it onto the filesystem and applies the static
+//! file policy.
+//!
+//! Static policy (constant, not configurable):
+//! * dotfiles / dotdirs and `*.toml`, `*.pem`, `*.key` are answered exactly like
+//!   a missing file (`Ok(None)` -> 31), so there is no existence oracle;
+//! * a file whose name ends with a configured script extension is never served
+//!   as static content (`PermissionDenied` -> 32), regardless of `order`,
+//!   `hide_scripts_behind` and even when scripting is disabled, because the
+//!   source must not leak after a config change. The name is checked both
+//!   lexically (before touching the filesystem, so existence is not revealed)
+//!   and on the canonical target (so a symlink alias cannot bypass it).
+
+use percent_encoding::percent_decode_str;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Error, ErrorKind};
+use std::path::{Path, PathBuf};
 
-pub fn resolve_path(root: &str, path: &str) -> std::io::Result<Option<PathBuf>> {
-	use std::io::{Error, ErrorKind};
-	use std::path::Component;
+pub const MAX_HEADERS: usize = 100;
+pub const MAX_HEADER_LINE: usize = 8192;
+pub const MAX_FIELDS: usize = 256;
 
-	let canonical_root = fs::canonicalize(root)?;
+const DEFAULT_LUA_EXTENSION: &str = ".script.lua";
+const DEFAULT_RHAI_EXTENSION: &str = ".script.rhai";
+const DENIED_EXTENSIONS: [&str; 3] = ["toml", "pem", "key"];
+const INDEX_FILE: &str = "index.tmkup";
 
-	let normalized_path = path.replace('\\', "/");
-	let is_directory = normalized_path.is_empty() || normalized_path.ends_with('/');
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathError {
+	/// NUL byte in the decoded path (maps to "30 Bad request").
+	Nul,
+	/// Decoded path is not valid UTF-8 (maps to "30 Bad request").
+	InvalidUtf8,
+	/// Path climbs above the root (maps to "32 Forbidden").
+	OutsideRoot,
+}
 
-	let mut relative = PathBuf::new();
+/// Configured script extensions with defaults applied; empty ones are dropped.
+pub fn script_extensions(lua: Option<&str>, rhai: Option<&str>) -> Vec<String> {
+	[
+		lua.unwrap_or(DEFAULT_LUA_EXTENSION),
+		rhai.unwrap_or(DEFAULT_RHAI_EXTENSION),
+	]
+	.into_iter()
+	.filter(|ext| !ext.is_empty())
+	.map(str::to_owned)
+	.collect()
+}
 
-	for component in PathBuf::from(&normalized_path).components() {
-		match component {
-			Component::Prefix(_) => {
-				return Err(Error::new(
-					ErrorKind::PermissionDenied,
-					"Path is outside root",
-				));
+/// Percent-decodes exactly once, rejecting NUL and invalid UTF-8.
+pub fn decode_request_path(raw: &str) -> Result<String, PathError> {
+	let decoded = percent_decode_str(raw)
+		.decode_utf8()
+		.map_err(|_| PathError::InvalidUtf8)?;
+
+	if decoded.contains('\0') {
+		return Err(PathError::Nul);
+	}
+
+	Ok(decoded.into_owned())
+}
+
+fn segments(decoded: &str) -> Result<(Vec<String>, bool), PathError> {
+	let unified = decoded.replace('\\', "/");
+	let mut parts: Vec<String> = Vec::new();
+	let mut is_directory = true;
+
+	for part in unified.split('/') {
+		is_directory = matches!(part, "" | "." | "..");
+
+		match part {
+			"" | "." => {}
+			".." => {
+				parts.pop().ok_or(PathError::OutsideRoot)?;
 			}
-			Component::RootDir | Component::CurDir => {}
-			Component::Normal(part) => relative.push(part),
-			Component::ParentDir => {
-				if !relative.pop() {
-					return Err(Error::new(
-						ErrorKind::PermissionDenied,
-						"Path is outside root",
-					));
-				}
-			}
+			other => parts.push(other.to_owned()),
 		}
+	}
+
+	let is_empty = parts.is_empty();
+	Ok((parts, is_directory || is_empty))
+}
+
+fn join_canonical(parts: &[String], is_directory: bool) -> String {
+	if parts.is_empty() {
+		return "/".to_owned();
+	}
+
+	let mut out = String::new();
+
+	for part in parts {
+		out.push('/');
+		out.push_str(part);
 	}
 
 	if is_directory {
-		relative.push("index.tmkup");
+		out.push('/');
 	}
 
-	if relative.as_os_str().is_empty() {
-		relative.push("index.tmkup");
-	}
+	out
+}
 
-	let mut current = canonical_root.clone();
-	let components: Vec<_> = relative.components().collect();
+/// Collapses an already decoded path into canonical form (`/a/b` or `/a/b/`).
+pub fn collapse_path(decoded: &str) -> Result<String, PathError> {
+	let (parts, is_directory) = segments(decoded)?;
 
-	for (index, component) in components.iter().enumerate() {
-		let Component::Normal(part) = component else {
-			continue;
-		};
+	Ok(join_canonical(&parts, is_directory))
+}
 
-		current.push(part);
+/// Full normalization of the raw (still percent-encoded) request path.
+pub fn normalize_request_path(raw: &str) -> Result<String, PathError> {
+	collapse_path(&decode_request_path(raw)?)
+}
 
-		match fs::symlink_metadata(&current) {
-			Ok(_) => {
-				let canonical = fs::canonicalize(&current)?;
+enum Verdict {
+	Allow,
+	Hidden,
+	Script,
+}
 
-				if !canonical.starts_with(&canonical_root) {
-					return Err(Error::new(
-						ErrorKind::PermissionDenied,
-						"Path is outside root",
-					));
-				}
+fn judge<'a>(names: impl Iterator<Item = &'a str>, script_exts: &[String]) -> Verdict {
+	let mut verdict = Verdict::Allow;
 
-				current = canonical;
+	for name in names {
+		if name.starts_with('.') {
+			return Verdict::Hidden;
+		}
 
-				if index + 1 < components.len() && !current.is_dir() {
-					return Ok(None);
-				}
-			}
-			Err(error) if error.kind() == ErrorKind::NotFound => {
-				return Ok(None);
-			}
-			Err(error) => return Err(error),
+		let lower = name.to_ascii_lowercase();
+		let denied = Path::new(&lower)
+			.extension()
+			.and_then(|ext| ext.to_str())
+			.is_some_and(|ext| DENIED_EXTENSIONS.contains(&ext));
+
+		if denied {
+			return Verdict::Hidden;
+		}
+
+		if script_exts
+			.iter()
+			.any(|ext| lower.ends_with(&ext.to_ascii_lowercase()))
+		{
+			verdict = Verdict::Script;
 		}
 	}
 
-	if current.is_file() {
-		Ok(Some(current))
-	} else {
-		Ok(None)
+	verdict
+}
+
+fn denied(message: &'static str) -> Error {
+	Error::new(ErrorKind::PermissionDenied, message)
+}
+
+fn map_path_error(error: PathError) -> Error {
+	match error {
+		PathError::OutsideRoot => denied("Path is outside root"),
+		PathError::Nul | PathError::InvalidUtf8 => {
+			Error::new(ErrorKind::InvalidInput, "Invalid request path")
+		}
 	}
 }
 
-pub fn percent_decode(value: &str) -> String {
-	use percent_encoding::percent_decode_str;
+/// Maps a canonical request path (see `normalize_request_path`) to a file.
+///
+/// `Ok(None)` = not found or hidden by policy; `PermissionDenied` = outside
+/// root or script source. The input is collapsed again but never decoded again.
+pub fn resolve_path(
+	root: &str,
+	path: &str,
+	script_exts: &[String],
+) -> std::io::Result<Option<PathBuf>> {
+	let canonical_root = fs::canonicalize(root)?;
+	let (mut parts, is_directory) = segments(path).map_err(map_path_error)?;
 
-	percent_decode_str(value).decode_utf8_lossy().into_owned()
+	if is_directory {
+		parts.push(INDEX_FILE.to_owned());
+	}
+
+	// The last name is checked before touching the filesystem on purpose.
+	match judge(parts.iter().map(String::as_str), script_exts) {
+		Verdict::Allow => {}
+		Verdict::Hidden => return Ok(None),
+		Verdict::Script => return Err(denied("Script sources are not served")),
+	}
+
+	let mut current = canonical_root.clone();
+
+	for (index, part) in parts.iter().enumerate() {
+		current.push(part);
+
+		match fs::symlink_metadata(&current) {
+			Ok(_) => {}
+			Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(error),
+		}
+
+		// Dangling symlinks and symlink loops count as missing, never as a read.
+		current = match fs::canonicalize(&current) {
+			Ok(canonical) => canonical,
+			Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(error),
+		};
+
+		if !current.starts_with(&canonical_root) {
+			return Err(denied("Path is outside root"));
+		}
+
+		if index + 1 < parts.len() && !current.is_dir() {
+			return Ok(None);
+		}
+	}
+
+	if !current.is_file() {
+		return Ok(None);
+	}
+
+	let relative = current
+		.strip_prefix(&canonical_root)
+		.map_err(|_| denied("Path is outside root"))?;
+	let names: Vec<String> = relative
+		.components()
+		.map(|component| component.as_os_str().to_string_lossy().into_owned())
+		.collect();
+
+	match judge(names.iter().map(String::as_str), script_exts) {
+		Verdict::Allow => Ok(Some(current)),
+		Verdict::Hidden => Ok(None),
+		Verdict::Script => Err(denied("Script sources are not served")),
+	}
 }
 
 #[cfg(test)]
-mod tests {
-	use super::*;
-	use std::fs;
-
-	fn temp_root(name: &str) -> std::path::PathBuf {
-		let dir = std::env::temp_dir().join(format!("tnet-tmutp-test-{}", name));
-		let _ = fs::remove_dir_all(&dir);
-		fs::create_dir_all(&dir).unwrap();
-		fs::write(dir.join("index.tmkup"), b"idx").unwrap();
-		fs::write(dir.join("hello.txt"), b"hi").unwrap();
-		fs::create_dir_all(dir.join("sub")).unwrap();
-		fs::write(dir.join("sub").join("file.txt"), b"x").unwrap();
-		dir
-	}
-
-	#[test]
-	fn resolve_path_blocks_traversal() {
-		let root = temp_root("trav");
-		let r = resolve_path(root.to_str().unwrap(), "../../etc/passwd");
-		assert!(r.is_err() || r.unwrap().is_none());
-		let _ = fs::remove_dir_all(&root);
-	}
-
-	#[test]
-	fn resolve_path_serves_existing_file() {
-		let root = temp_root("file");
-		let r = resolve_path(root.to_str().unwrap(), "hello.txt").unwrap();
-		assert!(r.is_some());
-		let _ = fs::remove_dir_all(&root);
-	}
-
-	#[test]
-	fn resolve_path_directory_index() {
-		let root = temp_root("dir");
-		let r = resolve_path(root.to_str().unwrap(), "").unwrap();
-		assert!(r.is_some());
-		let _ = fs::remove_dir_all(&root);
-	}
-
-	#[test]
-	fn resolve_path_missing_returns_none() {
-		let root = temp_root("missing");
-		let r = resolve_path(root.to_str().unwrap(), "nope.txt").unwrap();
-		assert!(r.is_none());
-		let _ = fs::remove_dir_all(&root);
-	}
-}
+#[path = "path_tests.rs"]
+mod tests;

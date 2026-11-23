@@ -1,3 +1,6 @@
+#[path = "../../common/conn/ssh.rs"]
+mod ssh;
+
 mod accept;
 mod dispatch;
 mod stream;

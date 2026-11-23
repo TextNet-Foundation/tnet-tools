@@ -8,6 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 
+use super::MAX_UTNP_RESPONSE;
+
+/// UTNP has no framing. The TextNet servers close the channel after the
+/// answer, and `Eof`/`Close` is the authoritative end marker. Only for a
+/// server that keeps the channel open the end is inferred from this much
+/// silence after the last data (with a warning).
+const UTNP_SILENCE: Duration = Duration::from_secs(3);
+
 pub enum SshAttemptError {
 	Unavailable(String),
 	Untrusted(String),
@@ -42,10 +50,36 @@ impl client::Handler for KnownHostsHandler {
 	}
 }
 
+/// Classifies a failure that happened before the server key was seen.
+///
+/// `ConnectionRefused` means that no SSH server listens here: `Unavailable`.
+/// Any other failure (reset, EOF, timeout, a peer that does not speak SSH)
+/// may be an attacker forcing a downgrade, so it is `Failed` unless the user
+/// passed --allow-insecure-fallback.
+pub(super) fn classify_connect_error(
+	error: &russh::Error,
+	allow_insecure: bool,
+) -> SshAttemptError {
+	let refused = matches!(
+		error,
+		russh::Error::IO(io) if io.kind() == std::io::ErrorKind::ConnectionRefused
+	);
+
+	if refused || allow_insecure {
+		return SshAttemptError::Unavailable(error.to_string());
+	}
+
+	SshAttemptError::Failed(anyhow!(
+		"{}: SSH connection failed: {error}",
+		super::SECURE_FAILED
+	))
+}
+
 pub async fn exchange_ssh(
 	host: &str,
 	port: u16,
 	request: &str,
+	policy: super::Policy,
 ) -> std::result::Result<Vec<u8>, SshAttemptError> {
 	let key_checked = Arc::new(AtomicBool::new(false));
 	let key_trusted = Arc::new(AtomicBool::new(false));
@@ -65,7 +99,7 @@ pub async fn exchange_ssh(
 	let config = Arc::new(config);
 
 	let mut session = match timeout(
-		Duration::from_secs(15),
+		policy.connect_timeout,
 		client::connect(config, (host, port), handler),
 	)
 	.await
@@ -87,7 +121,7 @@ pub async fn exchange_ssh(
 				)));
 			}
 
-			return Err(SshAttemptError::Unavailable(error.to_string()));
+			return Err(classify_connect_error(&error, policy.allow_insecure));
 		}
 
 		Err(_) => {
@@ -97,9 +131,14 @@ pub async fn exchange_ssh(
 				)));
 			}
 
-			return Err(SshAttemptError::Unavailable(
-				"SSH connection timed out".to_string(),
-			));
+			return Err(if policy.allow_insecure {
+				SshAttemptError::Unavailable("SSH connection timed out".to_string())
+			} else {
+				SshAttemptError::Failed(anyhow!(
+					"{}: SSH connection timed out",
+					super::SECURE_FAILED
+				))
+			});
 		}
 	};
 
@@ -142,13 +181,19 @@ pub async fn exchange_ssh(
 		let wait_duration = if response.is_empty() {
 			Duration::from_secs(30)
 		} else {
-			Duration::from_secs(1)
+			UTNP_SILENCE
 		};
 
 		let message = match timeout(wait_duration, channel.wait()).await {
 			Ok(message) => message,
 
-			Err(_) if !response.is_empty() => break,
+			Err(_) if !response.is_empty() => {
+				eprintln!(
+					"WARN: SSH response end was inferred from {} s of silence; it may be incomplete",
+					UTNP_SILENCE.as_secs()
+				);
+				break;
+			}
 
 			Err(_) => {
 				return Err(SshAttemptError::Failed(anyhow!(
@@ -158,11 +203,8 @@ pub async fn exchange_ssh(
 		};
 
 		match message {
+			// Only the data stream carries the response; stderr is ignored.
 			Some(ChannelMsg::Data { data }) => {
-				response.extend_from_slice(&data);
-			}
-
-			Some(ChannelMsg::ExtendedData { data, .. }) => {
 				response.extend_from_slice(&data);
 			}
 
@@ -172,15 +214,21 @@ pub async fn exchange_ssh(
 
 			Some(_) => {}
 		}
+
+		if response.len() > MAX_UTNP_RESPONSE {
+			return Err(SshAttemptError::Failed(anyhow!(
+				"UTNP response exceeds the size limit"
+			)));
+		}
 	}
+
+	let _ = channel.close().await;
 
 	if response.is_empty() {
 		return Err(SshAttemptError::Failed(anyhow!(
 			"UTNP server returned an empty SSH response"
 		)));
 	}
-
-	let _ = channel.close().await;
 
 	Ok(response)
 }

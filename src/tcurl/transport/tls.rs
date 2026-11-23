@@ -1,10 +1,9 @@
 use crate::transport::tcp::send_and_receive;
-use crate::types::{AttemptError, FrameKind};
+use crate::types::{AttemptError, FrameKind, Policy, classify_io_error};
 use anyhow::anyhow;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -19,6 +18,7 @@ pub async fn exchange_tls(
 	frame: FrameKind,
 	ca_cert: Option<&Path>,
 	verify_for_sni: Option<&str>,
+	policy: Policy,
 ) -> std::result::Result<Vec<u8>, AttemptError> {
 	let mut roots = RootCertStore::empty();
 
@@ -74,9 +74,26 @@ pub async fn exchange_tls(
 
 	let connector = TlsConnector::from(Arc::new(config));
 
-	let stream = TcpStream::connect((host, port))
-		.await
-		.map_err(|error| AttemptError::Unavailable(error.to_string()))?;
+	// Reaching the port is part of the secure attempt: a refused connection
+	// means "no listener" (Unavailable); a timeout or reset is classified by
+	// `classify_io_error` and is Fatal unless plaintext was explicitly allowed.
+	let stream = match timeout(policy.connect_timeout, TcpStream::connect((host, port))).await {
+		Ok(Ok(stream)) => stream,
+		Ok(Err(error)) => {
+			return Err(classify_io_error(
+				&error,
+				policy.allow_insecure,
+				"TLS connect",
+			));
+		}
+		Err(_) => {
+			return Err(classify_io_error(
+				&std::io::Error::from(std::io::ErrorKind::TimedOut),
+				policy.allow_insecure,
+				"TLS connect timed out",
+			));
+		}
+	};
 
 	stream
 		.set_nodelay(true)
@@ -88,7 +105,7 @@ pub async fn exchange_tls(
 		.map_err(|error| AttemptError::Fatal(error.into()))?;
 
 	let mut tls_stream = match timeout(
-		Duration::from_secs(15),
+		policy.connect_timeout,
 		connector.connect(server_name, stream),
 	)
 	.await
@@ -96,21 +113,18 @@ pub async fn exchange_tls(
 		Ok(Ok(stream)) => stream,
 
 		Ok(Err(error)) => {
-			return match error.kind() {
-				std::io::ErrorKind::UnexpectedEof
-				| std::io::ErrorKind::ConnectionReset
-				| std::io::ErrorKind::ConnectionAborted
-				| std::io::ErrorKind::BrokenPipe => Err(AttemptError::Unavailable(error.to_string())),
-
-				_ => Err(AttemptError::Fatal(anyhow!(
-					"TLS handshake or certificate verification failed: {error}"
-				))),
-			};
+			return Err(classify_io_error(
+				&error,
+				policy.allow_insecure,
+				"TLS handshake or certificate verification failed",
+			));
 		}
 
 		Err(_) => {
-			return Err(AttemptError::Unavailable(
-				"TLS handshake timed out".to_string(),
+			return Err(classify_io_error(
+				&std::io::Error::from(std::io::ErrorKind::TimedOut),
+				policy.allow_insecure,
+				"TLS handshake timed out",
 			));
 		}
 	};

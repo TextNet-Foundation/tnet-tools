@@ -1,5 +1,6 @@
 mod cli;
 mod request;
+mod sanitize;
 mod transport;
 
 use anyhow::{Result, bail};
@@ -32,7 +33,13 @@ async fn main() -> Result<()> {
 
 	let response = if args.v1 {
 		println!("Transport: TCP");
-		transport::exchange_tcp(&args.host, args.port, &request).await?
+		transport::exchange_tcp(
+			&args.host,
+			args.port,
+			&request,
+			transport::policy_from_args(&args).connect_timeout,
+		)
+		.await?
 	} else {
 		transport::exchange_v2(&args, &request).await?
 	};

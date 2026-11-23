@@ -18,10 +18,14 @@ pub fn parse_target(input: &str) -> Result<Target> {
 		bail!("User information in TextNet URIs is not supported");
 	}
 
-	let host = url
-		.host_str()
-		.ok_or_else(|| anyhow!("URI does not contain a host"))?
-		.to_string();
+	// IPv6 literals are returned without brackets, so they can be used for
+	// connect() and as a TLS ServerName (IpAddress).
+	let host = match url.host() {
+		Some(url::Host::Domain(domain)) => domain.to_string(),
+		Some(url::Host::Ipv4(address)) => address.to_string(),
+		Some(url::Host::Ipv6(address)) => address.to_string(),
+		None => bail!("URI does not contain a host"),
+	};
 
 	let path = if url.path().is_empty() {
 		"/"
@@ -63,9 +67,17 @@ pub fn normalize_u_port(input: &str) -> Result<(String, Option<u16>)> {
 	let authority = &rest[..authority_end];
 	let suffix = &rest[authority_end..];
 
-	let Some((host_part, port_part)) = authority.rsplit_once(':') else {
+	// The colons inside an IPv6 literal "[::1]" are not port separators.
+	let port_search_from = authority.rfind(']').map_or(0, |index| index + 1);
+
+	let Some(colon) = authority[port_search_from..].rfind(':') else {
 		return Ok((input.to_string(), None));
 	};
+
+	let (host_part, port_part) = (
+		&authority[..port_search_from + colon],
+		&authority[port_search_from + colon + 1..],
+	);
 
 	if !port_part.starts_with('u') {
 		return Ok((input.to_string(), None));
@@ -92,3 +104,7 @@ pub fn normalize_u_port(input: &str) -> Result<(String, Option<u16>)> {
 
 	Ok((normalized, Some(port)))
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

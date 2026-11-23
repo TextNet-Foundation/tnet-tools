@@ -10,14 +10,15 @@ use anyhow::Context;
 use args::Args;
 use clap::Parser;
 use request::build_request;
-use response::handle_response;
+use response::{OutputOptions, handle_response};
+use std::process::ExitCode;
 use target::parse_target;
 use transport::exchange_with_fallback;
 use types::{FrameKind, Method, Protocol, TransportTarget};
 use utnp::negotiate_endpoint;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
 	tracing_subscriber::fmt()
 		.with_env_filter(
 			tracing_subscriber::EnvFilter::try_from_default_env()
@@ -36,6 +37,12 @@ async fn main() -> anyhow::Result<()> {
 	} else {
 		Method::Get
 	};
+
+	if method == Method::Head && target.protocol == Protocol::Tmutp {
+		anyhow::bail!(
+			"TMUTP servers do not support HEAD (only GET and POST); use GET or a tbip:// URI"
+		);
+	}
 
 	if method == Method::Post && target.protocol != Protocol::Tmutp {
 		anyhow::bail!("POST is supported only by TMUTP");
@@ -93,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let endpoint = if let Some(port) = target.direct_port {
 		types::Endpoint {
-			host: target.host,
+			host: target.host.clone(),
 			port,
 		}
 	} else {
@@ -109,6 +116,14 @@ async fn main() -> anyhow::Result<()> {
 		negotiate_endpoint(&target, utnp_port, utnp_mode, &args).await?
 	};
 
+	if endpoint.host != target.host && !args.headers.is_empty() && !args.trust_utnp_host {
+		anyhow::bail!(
+			"Refusing to send -H headers to {} (the URI host is {}); use --trust-utnp-host to allow it",
+			endpoint.host,
+			target.host
+		);
+	}
+
 	eprintln!(
 		"Connecting to {}:{} using {}",
 		endpoint.host,
@@ -116,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 		target.protocol.name()
 	);
 
-	let response = exchange_with_fallback(
+	let exchanged = exchange_with_fallback(
 		&endpoint.host,
 		endpoint.port,
 		&request,
@@ -128,13 +143,16 @@ async fn main() -> anyhow::Result<()> {
 	)
 	.await?;
 
-	handle_response(
-		&response,
+	let code = handle_response(
+		&exchanged.data,
 		method == Method::Head,
-		&args.output,
-		&args.output_header,
+		OutputOptions {
+			output: &args.output,
+			output_header: &args.output_header,
+			output_on_error: args.output_on_error,
+		},
 	)
 	.await?;
 
-	Ok(())
+	Ok(ExitCode::from(code))
 }

@@ -1,4 +1,4 @@
-use crate::types::MAX_RESPONSE_BODY;
+use crate::types::{MAX_RESPONSE_BODY, MAX_RESPONSE_HEADER};
 use anyhow::{Context, Result, bail};
 
 pub fn parse_content_length(header: &[u8]) -> Result<usize> {
@@ -31,10 +31,23 @@ pub fn response_header_end(response: &[u8]) -> Option<usize> {
 		})
 }
 
-pub fn expected_response_length(response: &[u8], head: bool) -> Result<Option<usize>> {
+/// Checks a partially received protocol response and cuts bytes that exceed
+/// the announced Content-Length.
+///
+/// Returns `Ok(true)` once the whole response (headers, plus body unless
+/// `head`) is present.
+pub fn trim_and_check(response: &mut Vec<u8>, head: bool) -> Result<bool> {
 	let Some(header_end) = response_header_end(response) else {
-		return Ok(None);
+		if response.len() > MAX_RESPONSE_HEADER {
+			bail!("Response headers exceed the size limit");
+		}
+
+		return Ok(false);
 	};
+
+	if header_end > MAX_RESPONSE_HEADER {
+		bail!("Response headers exceed the size limit");
+	}
 
 	let content_length = parse_content_length(&response[..header_end])?;
 
@@ -42,5 +55,12 @@ pub fn expected_response_length(response: &[u8], head: bool) -> Result<Option<us
 		bail!("Response body exceeds the size limit");
 	}
 
-	Ok(Some(header_end + if head { 0 } else { content_length }))
+	let expected = header_end + if head { 0 } else { content_length };
+
+	if response.len() >= expected {
+		response.truncate(expected);
+		return Ok(true);
+	}
+
+	Ok(false)
 }

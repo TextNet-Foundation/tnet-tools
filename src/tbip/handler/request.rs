@@ -1,4 +1,4 @@
-use crate::common::{percent_decode, resolve_path};
+use crate::common::{ParseResult, parse_request, resolve_path, script_extensions};
 use crate::config::{
 	AppState, BAD_REQUEST, FORBIDDEN, METHOD_NOT_ALLOWED, NOT_FOUND, SERVER_ERROR,
 	TBIP_FIRST_VERSION, TBIP_VERSION,
@@ -8,82 +8,56 @@ use crate::handler::response::{
 	make_version_error_response, replace_response_version,
 };
 use crate::handler::script::normalize_script_path;
-use crate::path::validate_relative_path;
 use crate::script_engine::Request;
 use std::collections::HashMap;
 use std::io;
+
+/// TBIP-запросы не несут тела: любой ненулевой Content-Length отклоняется.
+pub const MAX_REQUEST_BODY: usize = 0;
+
+fn bad_request(message: &str) -> Vec<u8> {
+	make_error_response(BAD_REQUEST, "30 Bad request", message)
+}
+
+fn forbidden_response() -> Vec<u8> {
+	make_error_response(
+		FORBIDDEN,
+		"32 Forbidden",
+		"Access to the requested path is forbidden",
+	)
+}
+
 pub async fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
-	let header_end = match find_header_end(raw) {
-		Some(end) => end,
-		None => {
-			return make_error_response(
-				BAD_REQUEST,
-				"30 Bad request",
-				"Request headers are incomplete",
-			);
-		}
+	let parsed = match parse_request(raw, MAX_REQUEST_BODY) {
+		ParseResult::Ok(p) => p,
+		ParseResult::BadRequest(msg) => return bad_request(msg),
+		ParseResult::Forbidden => return forbidden_response(),
 	};
-	let request_line = raw[..header_end]
-		.split(|byte| *byte == b'\n')
-		.next()
-		.unwrap_or_default();
-	let request_version = match std::str::from_utf8(request_line) {
-		Ok(line) => line.split_whitespace().next(),
-		Err(_) => None,
-	};
-	let response_version = match request_version {
-		Some("TBIP/2.0") => TBIP_VERSION,
-		Some("TBIP/1.0") if state.support_first_version => TBIP_FIRST_VERSION,
-		Some("TBIP/1.0") => {
+
+	let response_version = match parsed.version.as_str() {
+		"TBIP/2.0" => TBIP_VERSION,
+		"TBIP/1.0" if state.support_first_version => TBIP_FIRST_VERSION,
+		"TBIP/1.0" => {
 			return make_version_error_response(
 				TBIP_VERSION,
 				"TBIP/1.0 support is disabled on this server",
 			);
 		}
-		Some(_) => {
+		_ => {
 			return make_version_error_response(TBIP_VERSION, "Server supports TBIP/2.0");
 		}
-		None => {
-			return make_error_response(
-				BAD_REQUEST,
-				"30 Bad request",
-				"Request line is missing or invalid",
-			);
-		}
 	};
-	let mut response = process_request_inner(raw, state).await;
+
+	let mut response = process_request_inner(&parsed, state).await;
+
 	replace_response_version(&mut response, response_version);
+
 	response
 }
-pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
-	let header_end = match find_header_end(raw) {
-		Some(end) => end,
-		None => {
-			return make_error_response(
-				BAD_REQUEST,
-				"30 Bad request",
-				"Request headers are incomplete",
-			);
-		}
-	};
-	let header_text = String::from_utf8_lossy(&raw[..header_end]);
-	let mut lines = header_text.lines();
-	let request_line = match lines.next() {
-		Some(line) => line.trim(),
-		None => {
-			return make_error_response(BAD_REQUEST, "30 Bad request", "Request line is missing");
-		}
-	};
-	let parts: Vec<&str> = request_line.split_whitespace().collect();
-	if parts.len() != 3 {
-		return make_error_response(
-			BAD_REQUEST,
-			"30 Bad request",
-			"Request must contain version, method and path",
-		);
-	}
-	let method = parts[1];
-	let raw_path = parts[2];
+
+async fn process_request_inner(parsed: &crate::common::ParsedRequest, state: &AppState) -> Vec<u8> {
+	let method = parsed.method.as_str();
+
 	if method != "GET" && method != "HEAD" {
 		return make_error_response(
 			METHOD_NOT_ALLOWED,
@@ -91,60 +65,24 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
 			"TBIP supports only GET and HEAD",
 		);
 	}
-	let (path, query_str) = if let Some(pos) = raw_path.find('?') {
-		let (path, query) = raw_path.split_at(pos);
-		(path, Some(&query[1..]))
-	} else {
-		(raw_path, None)
-	};
-	let decoded_path = percent_decode(path);
-	let query_params = if let Some(query) = query_str {
-		url::form_urlencoded::parse(query.as_bytes())
-			.into_owned()
-			.collect::<HashMap<String, String>>()
-	} else {
-		HashMap::new()
-	};
-	let mut request_headers = HashMap::new();
-	for line in lines {
-		let line = line.trim();
-		if line.is_empty() {
-			break;
-		}
-		if let Some((key, value)) = line.split_once(':') {
-			request_headers.insert(key.trim().to_lowercase(), value.trim().to_string());
-		}
-	}
-	if let Err(error) = validate_relative_path(&decoded_path) {
-		if error.kind() == io::ErrorKind::PermissionDenied {
-			return make_error_response(
-				FORBIDDEN,
-				"32 Forbidden",
-				"Access to the requested path is forbidden",
-			);
-		}
-		return make_error_response(
-			SERVER_ERROR,
-			"40 Server error",
-			"Failed to validate requested path",
-		);
-	}
-	let range_header = request_headers.get("range").cloned();
-	let accept_compression_header = request_headers.get("accept-compression").cloned();
+
+	let request_path = &parsed.path;
+	let range_header = parsed.headers.get("range").cloned();
+	let accept_compression_header = parsed.headers.get("accept-compression").cloned();
 	let accept_compression_present = accept_compression_header.is_some();
 	let compression = crate::common::negotiate_compression(accept_compression_header.as_deref());
-	let body_bytes = Vec::new();
-	let form_params = HashMap::new();
-	let script_path = normalize_script_path(&state.scripting_config, &decoded_path);
+
+	let script_path = normalize_script_path(&state.scripting_config, request_path);
 	let request = Request {
 		protocol: "tbip".to_string(),
 		method: method.to_string(),
-		path: decoded_path.clone(),
-		query: query_params,
-		body: body_bytes,
-		form: form_params,
-		headers: request_headers,
+		path: request_path.clone(),
+		query: parsed.query.clone(),
+		body: Vec::new(),
+		form: HashMap::new(),
+		headers: parsed.headers.clone(),
 	};
+
 	// Script engines
 	if state.scripting_config.enabled {
 		let order = state
@@ -185,11 +123,16 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
 			}
 		}
 	}
+
 	// Static files
+	let script_exts = script_extensions(
+		state.scripting_config.lua_extension.as_deref(),
+		state.scripting_config.rhai_extension.as_deref(),
+	);
 	match tokio::task::spawn_blocking({
 		let root = state.root.clone();
-		let p = decoded_path.clone();
-		move || resolve_path(&root, &p)
+		let p = request_path.clone();
+		move || resolve_path(&root, &p, &script_exts)
 	})
 	.await
 	.unwrap_or_else(|_| Err(io::Error::other("join error")))
@@ -231,7 +174,7 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
 				}
 			}
 			Err(error) => {
-				tracing::error!(path = %full_path.display(), error = %error, "failed to read file");
+				tracing::error!(path = ?full_path, error = %error, "failed to read file");
 				make_error_response(
 					SERVER_ERROR,
 					"40 Server error",
@@ -240,13 +183,12 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
 			}
 		},
 		Ok(None) => make_error_response(NOT_FOUND, "31 Not found", "Requested file was not found"),
-		Err(error) if error.kind() == io::ErrorKind::PermissionDenied => make_error_response(
-			FORBIDDEN,
-			"32 Forbidden",
-			"Access to the requested path is forbidden",
-		),
+		Err(error) if error.kind() == io::ErrorKind::PermissionDenied => forbidden_response(),
+		Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+			bad_request("Invalid request path")
+		}
 		Err(error) => {
-			tracing::error!(path = %decoded_path, error = %error, "path resolution failed");
+			tracing::error!(path = ?request_path, error = %error, "path resolution failed");
 			make_error_response(
 				SERVER_ERROR,
 				"40 Server error",
@@ -255,4 +197,7 @@ pub async fn process_request_inner(raw: &[u8], state: &AppState) -> Vec<u8> {
 		}
 	}
 }
-pub use crate::path::find_header_end;
+
+#[cfg(test)]
+#[path = "request_tests.rs"]
+mod tests;

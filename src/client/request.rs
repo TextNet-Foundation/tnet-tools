@@ -1,5 +1,7 @@
+use crate::sanitize::sanitize_terminal;
 use anyhow::{Result, bail};
 use std::fmt::Write;
+use std::io::IsTerminal;
 
 pub fn build_request(command: &crate::cli::Command, legacy: bool) -> Result<String> {
 	if legacy {
@@ -68,8 +70,16 @@ pub fn print_response(response: &[u8]) -> Result<()> {
 		bail!("UTNP server returned an empty response");
 	}
 
+	// Filter only when a person is looking at a terminal; pipes and files
+	// get the response unchanged.
+	let tty = std::io::stdout().is_terminal();
+
 	for line in response.lines() {
-		println!("← {}", line);
+		if tty {
+			println!("← {}", sanitize_terminal(line));
+		} else {
+			println!("← {}", line);
+		}
 	}
 
 	Ok(())

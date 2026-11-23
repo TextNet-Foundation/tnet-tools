@@ -28,6 +28,46 @@ pub fn parse_utnp_security(response: &str) -> Vec<String> {
 		.unwrap_or_default()
 }
 
+/// Hostnames and IP literals only: the value comes from the network and is
+/// printed to the terminal and used for connect().
+pub fn is_valid_host(host: &str) -> bool {
+	!host.is_empty()
+		&& host.len() <= 253
+		&& host
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'))
+}
+
+/// Chooses the host for the protocol connection.
+///
+/// A host announced over an unprotected UTNP exchange can be forged by anyone
+/// on the path, so it is ignored (only the port is taken) unless the user
+/// passed `--trust-utnp-host`. After a TLS/SSH-protected exchange the announced
+/// host is accepted.
+pub fn choose_host(original: &str, announced: &str, secure: bool, trusted: bool) -> String {
+	if announced.eq_ignore_ascii_case(original) {
+		return original.to_string();
+	}
+
+	if secure {
+		return announced.to_string();
+	}
+
+	if trusted {
+		eprintln!(
+			"WARN: --trust-utnp-host: using host {announced} announced over an unprotected UTNP exchange"
+		);
+		return announced.to_string();
+	}
+
+	eprintln!(
+		"WARN: UTNP (unprotected) announced host {announced}; ignoring it and keeping {original} \
+		 (use --trust-utnp-host to accept)"
+	);
+
+	original.to_string()
+}
+
 pub async fn negotiate_endpoint(
 	target: &Target,
 	utnp_port: u16,
@@ -63,7 +103,7 @@ pub async fn negotiate_endpoint(
 
 	let frame = crate::types::FrameKind::Utnp;
 
-	let response = exchange_with_fallback(
+	let exchanged = exchange_with_fallback(
 		&target.host,
 		utnp_port,
 		request.as_bytes(),
@@ -73,6 +113,9 @@ pub async fn negotiate_endpoint(
 	)
 	.await
 	.context("UTNP negotiation failed")?;
+
+	let secure_channel = exchanged.transport.is_secure();
+	let response = exchanged.data;
 
 	let response_text = String::from_utf8_lossy(&response);
 	let first_line = response_text
@@ -111,11 +154,18 @@ pub async fn negotiate_endpoint(
 		bail!("UTNP returned port 0");
 	}
 
-	let host = parts[5].to_string();
+	let announced_host = parts[5].trim_start_matches('[').trim_end_matches(']');
 
-	if host.is_empty() {
-		bail!("UTNP returned an empty protocol host");
+	if !is_valid_host(announced_host) {
+		bail!("UTNP returned an invalid protocol host");
 	}
+
+	let host = choose_host(
+		&target.host,
+		announced_host,
+		secure_channel,
+		args.trust_utnp_host,
+	);
 
 	let supported_security = if utnp_v1 {
 		Vec::new()
@@ -140,6 +190,13 @@ pub async fn negotiate_endpoint(
 	};
 
 	eprintln!("UTNP Security: {}", security_list);
+
+	if !secure_channel {
+		eprintln!(
+			"WARN: UTNP exchange was not protected by TLS/SSH; the Security header \
+			 and the announced host are not authenticated"
+		);
+	}
 
 	if !required_security.is_empty() {
 		let security_supported = required_security.iter().any(|required| {
@@ -179,3 +236,7 @@ pub async fn negotiate_endpoint(
 
 	Ok(Endpoint { host, port })
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

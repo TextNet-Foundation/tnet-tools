@@ -1,54 +1,3 @@
-use std::io;
-use std::path::{Component, PathBuf};
-
-pub fn validate_relative_path(path: &str) -> io::Result<PathBuf> {
-	use std::io::{Error, ErrorKind};
-
-	let normalized = path.replace('\\', "/");
-	let clean = normalized.trim_start_matches('/');
-
-	let mut relative = PathBuf::new();
-
-	for component in PathBuf::from(clean).components() {
-		match component {
-			Component::Prefix(_) | Component::RootDir => {
-				return Err(Error::new(
-					ErrorKind::PermissionDenied,
-					"Absolute filesystem path is forbidden",
-				));
-			}
-
-			Component::CurDir => {}
-
-			Component::ParentDir => {
-				if !relative.pop() {
-					return Err(Error::new(
-						ErrorKind::PermissionDenied,
-						"Path escapes document root",
-					));
-				}
-			}
-
-			Component::Normal(part) => {
-				relative.push(part);
-			}
-		}
-	}
-
-	Ok(relative)
-}
-
-pub fn find_header_end(raw: &[u8]) -> Option<usize> {
-	raw.windows(4)
-		.position(|window| window == b"\r\n\r\n")
-		.map(|position| position + 4)
-		.or_else(|| {
-			raw.windows(2)
-				.position(|window| window == b"\n\n")
-				.map(|position| position + 2)
-		})
-}
-
 pub fn mime_type(path: &std::path::Path) -> &'static str {
 	match path
 		.extension()
@@ -111,38 +60,5 @@ pub fn mime_type(path: &std::path::Path) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-	use std::fs;
-	fn temp_root(name: &str) -> std::path::PathBuf {
-		let dir = std::env::temp_dir().join(format!("tnet-tbip-test-{}", name));
-		let _ = fs::remove_dir_all(&dir);
-		fs::create_dir_all(&dir).unwrap();
-		fs::write(dir.join("index.tmkup"), b"idx").unwrap();
-		fs::write(dir.join("hello.bin"), b"hi").unwrap();
-		dir
-	}
-
-	#[test]
-	fn resolve_path_blocks_traversal() {
-		let root = temp_root("trav");
-		let r = crate::common::resolve_path(root.to_str().unwrap(), "../../etc/passwd");
-		assert!(r.is_err() || r.unwrap().is_none());
-		let _ = fs::remove_dir_all(&root);
-	}
-
-	#[test]
-	fn resolve_path_serves_existing_file() {
-		let root = temp_root("file");
-		let r = crate::common::resolve_path(root.to_str().unwrap(), "hello.bin").unwrap();
-		assert!(r.is_some());
-		let _ = fs::remove_dir_all(&root);
-	}
-
-	#[test]
-	fn resolve_path_missing_returns_none() {
-		let root = temp_root("missing");
-		let r = crate::common::resolve_path(root.to_str().unwrap(), "nope.bin").unwrap();
-		assert!(r.is_none());
-		let _ = fs::remove_dir_all(&root);
-	}
-}
+#[path = "path_tests.rs"]
+mod tests;

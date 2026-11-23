@@ -1,0 +1,28 @@
+[advisories]
+ignore = [
+	# chrono stays transitively via russh-util until russh drops it.
+	{ id = "RUSTSEC-2026-0543", reason = "transitive via russh-util; direct use is being removed" },
+]
+# smartstring (RUSTSEC-2026-0249) comes only via rhai; cargo-deny reports
+# unmaintained advisories for direct deps only, so no ignore entry is needed.
+# `cargo audit` will still warn about it until rhai drops the crate.
+
+[licenses]
+allow = [
+	"GPL-3.0-or-later",
+	"MIT",
+	"Apache-2.0",
+	"Apache-2.0 WITH LLVM-exception",
+	"BSD-2-Clause",
+	"BSD-3-Clause",
+	"ISC",
+	"Unicode-3.0",
+	"0BSD",
+	"Zlib",
+	"CC0-1.0",
+	"MPL-2.0",
+	"BSL-1.0",
+]
+
+[bans]
+multiple-versions = "warn"

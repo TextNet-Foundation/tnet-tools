@@ -1,6 +1,8 @@
+use crate::common::conn::{ServerLimits, harden_ssh_config, serve};
 use crate::config::{
 	AppState, Args, Config, SUPPORTED_COMPRESSION, TBIP_VERSION, load_ssh_config, load_tls_acceptor,
 };
+use crate::handler::response::make_error_response;
 use crate::script_engine::lua::LuaEngine;
 use crate::script_engine::rhai::RhaiEngine;
 use crate::server::dispatch::dispatch_connection;
@@ -9,13 +11,14 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio::time::{Duration, timeout};
-use tracing::{error, info};
+use tracing::{debug, info};
 
 pub async fn run() -> Result<()> {
 	let _ = tracing_subscriber::fmt()
-		.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+		.with_env_filter(
+			tracing_subscriber::EnvFilter::try_from_default_env()
+				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+		)
 		.try_init();
 
 	let args = Args::parse();
@@ -25,6 +28,7 @@ pub async fn run() -> Result<()> {
 		.with_context(|| format!("Failed to read config: {}", args.config))?;
 
 	let config: Config = toml::from_str(&config_content).context("Failed to parse TBIP config")?;
+	let config = config.normalized(&args.config)?;
 
 	let lua_engine = if config.scripting.enabled {
 		let ext = config
@@ -69,7 +73,13 @@ pub async fn run() -> Result<()> {
 	};
 
 	let ssh_config = if config.security.enable_ssh {
-		Some(load_ssh_config(&config.security)?)
+		let mut loaded = load_ssh_config(&config.security)?;
+
+		if let Some(ssh) = Arc::get_mut(&mut loaded) {
+			harden_ssh_config(ssh);
+		}
+
+		Some(loaded)
 	} else {
 		None
 	};
@@ -98,7 +108,7 @@ pub async fn run() -> Result<()> {
 		compression_cache_source_maximum: config.compression_cache_source_maximum,
 	};
 
-	let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
+	let listener = TcpListener::bind((config.bind_address.as_str(), config.port)).await?;
 
 	info!("TBIP server listening on port {}", config.port);
 	info!("Serving files from {}", config.root);
@@ -131,44 +141,27 @@ pub async fn run() -> Result<()> {
 		info!("Scripting disabled");
 	}
 
-	let semaphore = Arc::new(Semaphore::new(256));
+	let busy_reply = make_error_response(
+		"42 SERVICE UNAVAILABLE",
+		"42 Service unavailable",
+		"The server is at its connection limit",
+	);
 
-	loop {
-		tokio::select! {
-			_ = tokio::signal::ctrl_c() => {
-				info!("TBIP server shutting down");
-				break;
-			}
-			accept_result = listener.accept() => {
-				let (stream, peer) = match accept_result {
-					Ok(v) => v,
-					Err(error) => {
-						error!(error = %error, "accept error");
-						continue;
-					}
-				};
+	let limits = ServerLimits::default();
 
-				let permit = match semaphore.clone().acquire_owned().await {
-					Ok(p) => p,
-					Err(_) => continue,
-				};
+	serve(listener, &limits, &busy_reply, move |stream, peer| {
+		let state = state.clone();
+		let tls = tls_acceptor.clone();
+		let ssh = ssh_config.clone();
 
-				let state = state.clone();
-				let tls = tls_acceptor.clone();
-				let ssh = ssh_config.clone();
-
-				tokio::spawn(async move {
-					let _permit = permit;
-					let result = timeout(Duration::from_secs(120), dispatch_connection(stream, state, tls, ssh)).await;
-					match result {
-						Err(_) => error!(%peer, "connection timed out"),
-						Ok(Err(error)) => error!(%peer, error = %error, "connection failed"),
-						Ok(Ok(())) => {}
-					}
-				});
-			}
+		async move {
+			debug!(%peer, "connection accepted");
+			dispatch_connection(stream, state, tls, ssh).await
 		}
-	}
+	})
+	.await?;
+
+	info!("TBIP server stopped");
 
 	Ok(())
 }

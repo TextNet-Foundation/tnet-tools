@@ -1,4 +1,6 @@
 use crate::config::AppState;
+use crate::conn::{MAX_SSH_CHANNELS, TLS_HANDSHAKE, Transport, sniff_transport};
+use crate::protocol::{self, FrameStatus, Framer};
 use crate::server::stream;
 use anyhow::{Context, Result, anyhow};
 use std::net::SocketAddr;
@@ -15,21 +17,19 @@ pub async fn dispatch_connection(
 ) -> Result<()> {
 	stream.set_nodelay(true)?;
 
-	let transport = sniff_transport(&stream).await?;
-
-	match transport.as_str() {
-		"tls" => {
+	match sniff_transport(&stream).await? {
+		Transport::Tls => {
 			let acceptor = tls_acceptor
 				.ok_or_else(|| anyhow!("TLS handshake received but TLS is disabled"))?;
 
-			let tls = time::timeout(std::time::Duration::from_secs(15), acceptor.accept(stream))
+			let tls = time::timeout(TLS_HANDSHAKE, acceptor.accept(stream))
 				.await
 				.context("TLS handshake timed out")??;
 
 			stream::serve_stream(tls, state, true).await?;
 		}
 
-		"ssh" => {
+		Transport::Ssh => {
 			let config =
 				ssh_config.ok_or_else(|| anyhow!("SSH handshake received but SSH is disabled"))?;
 
@@ -42,58 +42,28 @@ pub async fn dispatch_connection(
 			session.await?;
 		}
 
-		_ => {
+		Transport::Plain => {
 			stream::serve_stream(stream, state, false).await?;
 		}
 	}
 
-	let _ = peer;
+	tracing::debug!(%peer, "connection finished");
 	Ok(())
 }
 
-pub async fn sniff_transport(stream: &TcpStream) -> Result<String> {
-	let mut peek = [0u8; 8];
-
-	let n = time::timeout(std::time::Duration::from_secs(10), async {
-		loop {
-			let n = stream.peek(&mut peek).await?;
-
-			if n == 0 {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::UnexpectedEof,
-					"client closed before sending data",
-				));
-			}
-
-			if n >= 4 || (n >= 2 && peek[0] == 0x16) {
-				return Ok(n);
-			}
-
-			let _ = stream.ready(tokio::io::Interest::READABLE).await;
-		}
-	})
-	.await
-	.context("Timed out while identifying connection transport")??;
-
-	if n >= 4 && &peek[..4] == b"SSH-" {
-		return Ok("ssh".into());
-	}
-
-	if n >= 2 && peek[0] == 0x16 && peek[1] == 0x03 {
-		return Ok("tls".into());
-	}
-
-	Ok("plain".into())
-}
-use crate::protocol;
 use bytes::Bytes;
 use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId};
 use std::collections::HashMap;
 
+struct ChannelBuffer {
+	data: Vec<u8>,
+	framer: Framer,
+}
+
 struct SshHandler {
 	state: AppState,
-	buffers: HashMap<ChannelId, Vec<u8>>,
+	buffers: HashMap<ChannelId, ChannelBuffer>,
 }
 
 impl Handler for SshHandler {
@@ -109,7 +79,20 @@ impl Handler for SshHandler {
 		reply: russh::server::ChannelOpenHandle,
 		_session: &mut Session,
 	) -> std::result::Result<(), Self::Error> {
-		self.buffers.insert(channel.id(), Vec::new());
+		if self.buffers.len() >= MAX_SSH_CHANNELS {
+			reply
+				.reject(russh::ChannelOpenFailure::ResourceShortage)
+				.await;
+			return Ok(());
+		}
+
+		self.buffers.insert(
+			channel.id(),
+			ChannelBuffer {
+				data: Vec::new(),
+				framer: Framer::new(),
+			},
+		);
 		reply.accept().await;
 		Ok(())
 	}
@@ -144,26 +127,32 @@ impl Handler for SshHandler {
 		data: &[u8],
 		session: &mut Session,
 	) -> std::result::Result<(), Self::Error> {
-		let buffer = self.buffers.entry(channel).or_default();
-
-		buffer.extend_from_slice(data);
-
-		if buffer.len() > 1024 * 1024 {
-			self.buffers.remove(&channel);
-			session.close(channel)?;
+		let Some(channel_buffer) = self.buffers.get_mut(&channel) else {
 			return Ok(());
+		};
+
+		channel_buffer.data.extend_from_slice(data);
+
+		loop {
+			match channel_buffer.framer.poll(&channel_buffer.data) {
+				FrameStatus::Complete(length) => {
+					let frame: Vec<u8> = channel_buffer.data.drain(..length).collect();
+					channel_buffer.framer.reset();
+
+					let response = protocol::process_request(&frame, &self.state);
+					session.data(channel, Bytes::from(response))?;
+				}
+				FrameStatus::Incomplete => return Ok(()),
+				FrameStatus::Invalid(reason) => {
+					let response = protocol::error_response("2.0", reason);
+
+					session.data(channel, Bytes::from(response))?;
+					self.buffers.remove(&channel);
+					session.close(channel)?;
+					return Ok(());
+				}
+			}
 		}
-
-		while let Some(frame_len) = protocol::complete_frame_len(buffer) {
-			let mut frame = Vec::with_capacity(frame_len);
-			frame.extend(buffer.drain(..frame_len));
-
-			let response = protocol::process_request(&frame, &self.state);
-
-			session.data(channel, Bytes::from(response))?;
-		}
-
-		Ok(())
 	}
 
 	async fn channel_close(

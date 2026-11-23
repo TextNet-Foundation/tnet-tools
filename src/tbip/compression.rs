@@ -1,34 +1,19 @@
-use crate::common::{cache_path, compress_body};
+use crate::common::{FileBody, compress_body};
 use crate::config::{
 	AppState, INVALID_RANGE, OK, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION, TBIP_VERSION,
 	UNSUPPORTED_RANGE,
 };
 use crate::path::mime_type;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 use std::fmt::Write;
-use std::path::Path;
 use std::time::SystemTime;
 
-pub async fn get_cached_only(
-	cache_dir: &Path,
-	source_path: &Path,
-	body: &[u8],
-	alg: &str,
-) -> Option<Vec<u8>> {
-	let cache_file = cache_path(cache_dir, source_path, alg);
-	let current_hash = Sha256::digest(body);
-	if let Ok(data) = tokio::fs::read(&cache_file).await
-		&& data.len() >= 32
-		&& data[..32] == current_hash[..]
-	{
-		return Some(data[32..].to_vec());
-	}
-	None
-}
+/// Largest range that is compressed inline. `make_range_response` is synchronous (its caller
+/// does not await it), so bigger ranges are sent uncompressed instead of blocking the reactor.
+const RANGE_INLINE_COMPRESS_MAX: usize = 256 * 1024;
 
 // -----------------------------------------------------------------------------
-// Range support (moved here to keep response.rs under 300 lines)
+// Range support
 // -----------------------------------------------------------------------------
 #[derive(Debug)]
 pub enum RangeParseResult {
@@ -69,7 +54,7 @@ pub fn parse_range(value: &str) -> RangeParseResult {
 }
 
 pub fn make_range_response(
-	content: &[u8],
+	content: &FileBody,
 	modified: Option<SystemTime>,
 	range_header: &str,
 	compression: Option<&str>,
@@ -107,23 +92,23 @@ pub fn make_range_response(
 	}
 	let end = end.min(source_length - 1);
 	let range_content = &content[start..=end];
-	let (body, content_encoding) = if let Some(alg) = compression {
-		if range_content.len() >= state.compression_minimum {
-			match compress_body(range_content, alg) {
-				Some(data) => (data, Some(alg)),
-				None => (range_content.to_vec(), None),
-			}
-		} else {
-			(range_content.to_vec(), None)
+
+	let compressed = match compression {
+		Some(alg)
+			if range_content.len() >= state.compression_minimum
+				&& range_content.len() <= RANGE_INLINE_COMPRESS_MAX =>
+		{
+			compress_body(range_content, alg).map(|data| (data, alg))
 		}
-	} else {
-		(range_content.to_vec(), None)
+		_ => None,
 	};
-	let hash = Sha256::digest(content);
-	let mut hash_hex = String::new();
-	write!(hash_hex, "{:x}", hash).unwrap();
+	let (body, content_encoding): (&[u8], Option<&str>) = match &compressed {
+		Some((data, alg)) => (data, Some(alg)),
+		None => (range_content, None),
+	};
+
 	let mut header = String::new();
-	write!(
+	let _ = write!(
 		header,
 		"{} {}\nContent-Type: {}\nContent-Length: {}\nContent-Range: bytes {}-{}/{}\n",
 		TBIP_VERSION,
@@ -133,30 +118,30 @@ pub fn make_range_response(
 		start,
 		end,
 		source_length,
-	)
-	.unwrap();
-	// append metadata
-	writeln!(header, "FILE-SHA256: {}", hash_hex).unwrap();
-	writeln!(header, "SOURCE-CONTENT-LENGTH: {}", source_length).unwrap();
+	);
+	// The whole-file hash is taken from the cache, never recomputed per request.
+	let _ = writeln!(header, "FILE-SHA256: {}", content.sha256_hex());
+	let _ = writeln!(header, "SOURCE-CONTENT-LENGTH: {}", source_length);
 	header.push_str("Accept-Ranges: bytes\n");
 	if let Some(modified) = modified {
 		let date: DateTime<Utc> = modified.into();
-		writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d")).unwrap();
+		let _ = writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d"));
 	}
 	if announce_compression {
-		writeln!(
+		let _ = writeln!(
 			header,
 			"Supported-Compression: {}",
 			SUPPORTED_COMPRESSION.join(", ")
-		)
-		.unwrap();
+		);
 	}
 	if let Some(alg) = content_encoding {
-		writeln!(header, "Content-Encoding: {}", alg).unwrap();
+		let _ = writeln!(header, "Content-Encoding: {}", alg);
 	}
 	header.push('\n');
-	let mut response = header.into_bytes();
-	response.extend_from_slice(&body);
+
+	let mut response = Vec::with_capacity(header.len() + body.len());
+	response.extend_from_slice(header.as_bytes());
+	response.extend_from_slice(body);
 	response
 }
 
@@ -173,22 +158,25 @@ pub fn make_range_error_response(
 		_ => "The requested range cannot be fulfilled.",
 	};
 	let mut body = String::new();
-	writeln!(body, "{}", message).unwrap();
+	let _ = writeln!(body, "{}", message);
 	let mut header = String::new();
-	write!(
+	let _ = write!(
 		header,
 		"{} {}\nContent-Type: text/plain\nContent-Length: {}\n",
 		TBIP_VERSION,
 		status,
 		body.len()
-	)
-	.unwrap();
+	);
 	if let Some(length) = source_length {
-		writeln!(header, "SOURCE-CONTENT-LENGTH: {}", length).unwrap();
+		let _ = writeln!(header, "SOURCE-CONTENT-LENGTH: {}", length);
 	}
-	writeln!(header, "Range-Error: {}; {}", range_header.trim(), reason).unwrap();
+	let _ = writeln!(header, "Range-Error: {}; {}", range_header.trim(), reason);
 	header.push('\n');
 	let mut response = header.into_bytes();
 	response.extend_from_slice(body.as_bytes());
 	response
 }
+
+#[cfg(test)]
+#[path = "tests/compression_tests.rs"]
+mod tests;

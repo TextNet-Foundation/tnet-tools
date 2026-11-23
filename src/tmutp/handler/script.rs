@@ -1,5 +1,6 @@
 use crate::common::compress_body;
 use crate::config::*;
+use crate::script_engine::guard::{RunError, run_script, validate_response};
 use crate::script_engine::{Request, Response, ScriptEngine};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -20,10 +21,13 @@ pub fn normalize_script_path(decoded_path: &str, state: &crate::config::AppState
 			.clone()
 			.unwrap_or_else(|| ".script.rhai".to_string());
 
-		if script_path.ends_with(&lua_ext) {
-			script_path = script_path.trim_end_matches(&lua_ext).to_string();
-		} else if script_path.ends_with(&rhai_ext) {
-			script_path = script_path.trim_end_matches(&rhai_ext).to_string();
+		let stripped = [&lua_ext, &rhai_ext]
+			.into_iter()
+			.filter(|ext| !ext.is_empty())
+			.find_map(|ext| script_path.strip_suffix(ext.as_str()));
+
+		if let Some(stripped) = stripped {
+			script_path = stripped.to_string();
 		}
 
 		if script_path.is_empty() {
@@ -34,34 +38,41 @@ pub fn normalize_script_path(decoded_path: &str, state: &crate::config::AppState
 	script_path
 }
 
+fn script_failure_response(status: &str, title: &str) -> Vec<u8> {
+	crate::handler::response::make_error_response(
+		status,
+		title,
+		"The script could not be executed.",
+	)
+}
+
 pub fn make_script_response(
 	response: Response,
 	compression: Option<&str>,
 	compression_minimum: usize,
 	announce_compression: bool,
 ) -> Vec<u8> {
+	if let Err(reason) = validate_response(&response, |code| status_code_to_text(code) != "UNKNOWN")
+	{
+		tracing::error!(reason, "rejected invalid script response");
+		return script_failure_response(METHOD_NOT_ALLOWED, "50 Invalid script response");
+	}
+
 	let status_text = status_code_to_text(response.status);
 	let mut output = String::new();
-	writeln!(
+	let _ = writeln!(
 		output,
 		"{} {} {}",
 		TMUTP_VERSION, response.status, status_text
-	)
-	.unwrap();
+	);
 
-	let mut has_content_type = false;
-	let mut has_content_encoding = false;
+	let has_content_type = response
+		.headers
+		.keys()
+		.any(|key| key.eq_ignore_ascii_case("content-type"));
 
 	for (key, value) in &response.headers {
-		if key.eq_ignore_ascii_case("content-type") {
-			has_content_type = true;
-		}
-
-		if key.eq_ignore_ascii_case("content-encoding") {
-			has_content_encoding = true;
-		}
-
-		writeln!(output, "{}: {}", key, value).unwrap();
+		let _ = writeln!(output, "{}: {}", key, value);
 	}
 
 	if !has_content_type {
@@ -69,38 +80,30 @@ pub fn make_script_response(
 	}
 
 	if announce_compression {
-		writeln!(
+		let _ = writeln!(
 			output,
 			"Supported-Compression: {}",
 			SUPPORTED_COMPRESSION.join(", ")
-		)
-		.unwrap();
+		);
 	}
 
 	let original_body = response.body.as_deref().unwrap_or(&[]);
 
-	let (body, content_encoding) = if !has_content_encoding {
-		if let Some(alg) = compression {
-			if original_body.len() >= compression_minimum {
-				match compress_body(original_body, alg) {
-					Some(data) => (data, Some(alg)),
-					None => (original_body.to_vec(), None),
-				}
-			} else {
-				(original_body.to_vec(), None)
+	let (body, content_encoding) = match compression {
+		Some(alg) if original_body.len() >= compression_minimum => {
+			match compress_body(original_body, alg) {
+				Some(data) => (data, Some(alg)),
+				None => (original_body.to_vec(), None),
 			}
-		} else {
-			(original_body.to_vec(), None)
 		}
-	} else {
-		(original_body.to_vec(), None)
+		_ => (original_body.to_vec(), None),
 	};
 
 	if let Some(alg) = content_encoding {
-		writeln!(output, "Content-Encoding: {}", alg).unwrap();
+		let _ = writeln!(output, "Content-Encoding: {}", alg);
 	}
 
-	write!(output, "Content-Length: {}\n\n", body.len()).unwrap();
+	let _ = write!(output, "Content-Length: {}\n\n", body.len());
 
 	let mut bytes = output.into_bytes();
 	bytes.extend_from_slice(&body);
@@ -160,14 +163,13 @@ pub async fn try_handle_script(
 			continue;
 		}
 
-		let exec_result = tokio::task::spawn_blocking({
-			let engine = engine.clone();
-			let sp = script_path.to_string();
-			let rq = request.clone();
-			move || engine.execute(&sp, &rq)
-		})
-		.await
-		.unwrap_or_else(|_| Err("join error".to_string()));
+		let exec_result = run_script(
+			engine,
+			script_path.to_string(),
+			request.clone(),
+			&state.scripting_config,
+		)
+		.await;
 
 		return Some(match exec_result {
 			Ok(Some(response)) => make_script_response(
@@ -177,14 +179,13 @@ pub async fn try_handle_script(
 				accept_compression_present,
 			),
 			Ok(None) => crate::handler::response::make_empty_response(),
-			Err(error) => {
-				tracing::error!(engine = label, error = %error, "script error");
-
-				crate::handler::response::make_error_response(
-					SERVER_ERROR,
-					"40 Server error",
-					&format!("{} script error: {}", label, error),
-				)
+			Err(RunError::Busy) => {
+				tracing::warn!(engine = label, "script slots exhausted");
+				script_failure_response("42 SERVICE UNAVAILABLE", "42 Service unavailable")
+			}
+			Err(RunError::Failed(err)) => {
+				tracing::error!(engine = label, ?err, "script error");
+				script_failure_response(SERVER_ERROR, "40 Server error")
 			}
 		});
 	}

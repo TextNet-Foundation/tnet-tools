@@ -1,4 +1,8 @@
 mod config;
+
+#[path = "../common/conn/mod.rs"]
+mod conn;
+
 mod protocol;
 mod server;
 mod tls;

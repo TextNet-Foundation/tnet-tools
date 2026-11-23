@@ -107,6 +107,25 @@ pub struct Args {
 	#[arg(long)]
 	pub verify_for_sni: Option<String>,
 
+	/// Allow falling back to plaintext TCP when SSH/TLS cannot be established.
+	/// Without it a failed secure handshake is an error. -t/--tcp/--v1 still
+	/// select plaintext explicitly.
+	#[arg(long = "allow-insecure-fallback")]
+	pub allow_insecure_fallback: bool,
+
+	/// Trust the host announced by UTNP even when the UTNP exchange was not
+	/// protected by TLS/SSH, and allow -H headers to be sent to that host.
+	#[arg(long = "trust-utnp-host")]
+	pub trust_utnp_host: bool,
+
+	/// Write the body to --output even when the status is not 2x.
+	#[arg(long = "output-on-error")]
+	pub output_on_error: bool,
+
+	/// Connect and handshake timeout in seconds.
+	#[arg(long, default_value_t = 15)]
+	pub timeout: u64,
+
 	/// Default UTNP port when URI has no port
 	#[arg(long, default_value_t = 34)]
 	pub utnp_port: u16,

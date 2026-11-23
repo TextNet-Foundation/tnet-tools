@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -19,6 +20,7 @@ pub async fn exchange_tls(
 	request: &str,
 	ca_cert: Option<&Path>,
 	verify_for_sni: Option<&str>,
+	policy: super::Policy,
 ) -> std::result::Result<Vec<u8>, TlsAttemptError> {
 	// Загружаем системные корневые сертификаты.
 	let native_certs = rustls_native_certs::load_native_certs();
@@ -76,10 +78,23 @@ pub async fn exchange_tls(
 
 	let connector = TlsConnector::from(Arc::new(config));
 
-	let stream = TcpStream::connect((host, port))
-		.await
-		.map_err(anyhow::Error::from)
-		.map_err(TlsAttemptError::Fatal)?;
+	let stream = match timeout(policy.connect_timeout, TcpStream::connect((host, port))).await {
+		Ok(Ok(stream)) => stream,
+		Ok(Err(error)) => {
+			return Err(classify_io_error(
+				&error,
+				policy.allow_insecure,
+				"TLS connect",
+			));
+		}
+		Err(_) => {
+			return Err(classify_io_error(
+				&std::io::Error::from(std::io::ErrorKind::TimedOut),
+				policy.allow_insecure,
+				"TLS connect timed out",
+			));
+		}
+	};
 
 	stream
 		.set_nodelay(true)
@@ -92,26 +107,86 @@ pub async fn exchange_tls(
 		.map_err(anyhow::Error::from)
 		.map_err(TlsAttemptError::Fatal)?;
 
-	let mut tls_stream = match connector.connect(server_name, stream).await {
-		Ok(stream) => stream,
+	let mut tls_stream = match timeout(
+		policy.connect_timeout,
+		connector.connect(server_name, stream),
+	)
+	.await
+	{
+		Ok(Ok(stream)) => stream,
 
-		Err(error) => {
-			// Ошибки проверки сертификата не должны приводить
-			// к незаметному переходу на незашифрованный TCP.
-			return match error.kind() {
-				std::io::ErrorKind::UnexpectedEof
-				| std::io::ErrorKind::ConnectionReset
-				| std::io::ErrorKind::ConnectionAborted
-				| std::io::ErrorKind::BrokenPipe => Err(TlsAttemptError::Unavailable(error.to_string())),
+		Ok(Err(error)) => {
+			// Certificate errors never turn into a silent plaintext fallback.
+			return Err(classify_io_error(
+				&error,
+				policy.allow_insecure,
+				"TLS handshake failed",
+			));
+		}
 
-				_ => Err(TlsAttemptError::Fatal(anyhow!(
-					"TLS handshake failed: {error}"
-				))),
-			};
+		Err(_) => {
+			return Err(classify_io_error(
+				&std::io::Error::from(std::io::ErrorKind::TimedOut),
+				policy.allow_insecure,
+				"TLS handshake timed out",
+			));
 		}
 	};
 
 	super::send_request(&mut tls_stream, request)
 		.await
 		.map_err(TlsAttemptError::Fatal)
+}
+
+/// Classifies a failure to reach a secure (TLS) peer.
+///
+/// - `ConnectionRefused`: nothing listens on the port, so the service does not
+///   offer TLS here; always `Unavailable`.
+/// - `UnexpectedEof`, `ConnectionReset`, `ConnectionAborted`, `BrokenPipe`,
+///   `TimedOut` and rustls "not a TLS peer" messages are ambiguous: a plaintext
+///   service looks the same as an attacker cutting the handshake. They are
+///   `Unavailable` (plaintext fallback possible) only with the explicit
+///   --allow-insecure-fallback; otherwise `Fatal`.
+/// - Everything else (certificate errors, ...) is always `Fatal`.
+pub(super) fn classify_io_error(
+	error: &std::io::Error,
+	allow_insecure: bool,
+	context: &str,
+) -> TlsAttemptError {
+	use std::io::ErrorKind;
+
+	if error.kind() == ErrorKind::ConnectionRefused {
+		return TlsAttemptError::Unavailable(error.to_string());
+	}
+
+	let not_tls = matches!(
+		error
+			.get_ref()
+			.and_then(|inner| inner.downcast_ref::<tokio_rustls::rustls::Error>()),
+		Some(
+			tokio_rustls::rustls::Error::InvalidMessage(_)
+				| tokio_rustls::rustls::Error::InappropriateMessage { .. }
+				| tokio_rustls::rustls::Error::InappropriateHandshakeMessage { .. }
+		)
+	);
+
+	let ambiguous = not_tls
+		|| matches!(
+			error.kind(),
+			ErrorKind::UnexpectedEof
+				| ErrorKind::ConnectionReset
+				| ErrorKind::ConnectionAborted
+				| ErrorKind::BrokenPipe
+				| ErrorKind::TimedOut
+		);
+
+	if ambiguous && allow_insecure {
+		return TlsAttemptError::Unavailable(error.to_string());
+	}
+
+	if ambiguous {
+		return TlsAttemptError::Fatal(anyhow!("{}: {context}: {error}", super::SECURE_FAILED));
+	}
+
+	TlsAttemptError::Fatal(anyhow!("{context}: {error}"))
 }

@@ -1,30 +1,64 @@
-use crate::common::compress_body;
-use crate::common::get_compressed_cached;
-use crate::config::{OK, OK_EMPTY, SUPPORTED_COMPRESSION, TMUTP_VERSION};
-use sha2::Digest;
+use crate::common::{DiskCachePolicy, FileBody, compress_blocking, get_compressed_cached};
+use crate::config::{
+	INVALID_RANGE, OK, OK_EMPTY, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION, TMUTP_VERSION,
+	UNSUPPORTED_RANGE,
+};
+use crate::handler::response::{RangeParseResult, make_range_error_response, parse_range};
+use bytes::Bytes;
 use std::fmt::Write;
+use std::path::Path;
+use std::time::SystemTime;
 
-pub fn make_range_response(
-	content: &[u8],
-	modified: Option<std::time::SystemTime>,
+/// Appends the optional trailer headers shared by file and range responses.
+fn append_trailer(
+	header: &mut String,
+	announce_compression: bool,
+	content_encoding: Option<&str>,
+	modified: Option<SystemTime>,
+) {
+	if announce_compression {
+		let _ = writeln!(
+			header,
+			"Supported-Compression: {}",
+			SUPPORTED_COMPRESSION.join(", ")
+		);
+	}
+
+	if let Some(alg) = content_encoding {
+		let _ = writeln!(header, "Content-Encoding: {}", alg);
+	}
+
+	if let Some(modified) = modified {
+		let date: chrono::DateTime<chrono::Utc> = modified.into();
+		let _ = writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d"));
+	}
+
+	header.push('\n');
+}
+
+/// Joins header and body in a single allocation (the body is copied exactly once).
+fn assemble(header: String, body: &[u8]) -> Vec<u8> {
+	let mut response = Vec::with_capacity(header.len() + body.len());
+	response.extend_from_slice(header.as_bytes());
+	response.extend_from_slice(body);
+	response
+}
+
+pub async fn make_range_response(
+	content: &FileBody,
+	modified: Option<SystemTime>,
 	range_header: &str,
 	compression: Option<&str>,
 	compression_minimum: usize,
 	announce_compression: bool,
-	file_sha256_hex: Option<&str>,
 ) -> Vec<u8> {
-	use crate::config::{
-		INVALID_RANGE, OK, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION, TMUTP_VERSION,
-		UNSUPPORTED_RANGE,
-	};
-
 	let source_length = content.len();
 
-	let (start, end) = match crate::handler::response::parse_range(range_header) {
-		crate::handler::response::RangeParseResult::Valid(start, end) => (start, end),
+	let (start, end) = match parse_range(range_header) {
+		RangeParseResult::Valid(start, end) => (start, end),
 
-		crate::handler::response::RangeParseResult::Invalid => {
-			return crate::handler::response::make_range_error_response(
+		RangeParseResult::Invalid => {
+			return make_range_error_response(
 				INVALID_RANGE,
 				range_header,
 				"invalid-range",
@@ -32,14 +66,14 @@ pub fn make_range_response(
 			);
 		}
 
-		crate::handler::response::RangeParseResult::Unsupported => {
+		RangeParseResult::Unsupported => {
 			let reason = if range_header.contains(',') {
 				"multiple-ranges-not-supported"
 			} else {
 				"range-form-not-supported"
 			};
 
-			return crate::handler::response::make_range_error_response(
+			return make_range_error_response(
 				UNSUPPORTED_RANGE,
 				range_header,
 				reason,
@@ -49,7 +83,7 @@ pub fn make_range_response(
 	};
 
 	if start >= source_length || end >= source_length {
-		return crate::handler::response::make_range_error_response(
+		return make_range_error_response(
 			RANGE_NOT_SATISFIABLE,
 			range_header,
 			"outside-source",
@@ -57,143 +91,87 @@ pub fn make_range_response(
 		);
 	}
 
-	let range_content = &content[start..=end];
+	// Zero-copy view into the cached file.
+	let range_content = content.bytes().slice(start..=end);
 
-	let (body, content_encoding) = if let Some(alg) = compression {
-		if range_content.len() >= compression_minimum {
-			match compress_body(range_content, alg) {
-				Some(data) => (data, Some(alg)),
-				None => (range_content.to_vec(), None),
-			}
-		} else {
-			(range_content.to_vec(), None)
+	let compressed = match compression {
+		Some(alg) if range_content.len() >= compression_minimum => {
+			compress_blocking(range_content.clone(), alg)
+				.await
+				.map(|data| (data, alg))
 		}
-	} else {
-		(range_content.to_vec(), None)
+		_ => None,
 	};
 
-	let hash_hex = match file_sha256_hex {
-		Some(hex) => hex.to_string(),
-		None => {
-			let mut s = String::new();
-			write!(s, "{:x}", sha2::Sha256::digest(content)).unwrap();
-			s
-		}
+	let (body, content_encoding) = match compressed {
+		Some((data, alg)) => (data, Some(alg)),
+		None => (range_content, None),
 	};
 
+	// The whole-file hash comes from the cache; a range request never re-hashes the file.
 	let mut header = String::new();
-	write!(
-        header,
-        "{} {}\nContent-Type: text/tmkup\nContent-Length: {}\nContent-Range: bytes {}-{}/{}\nFILE-SHA256: {}\nSOURCE-CONTENT-LENGTH: {}\n",
-        TMUTP_VERSION,
-        OK,
-        body.len(),
-        start,
-        end,
-        source_length,
-        hash_hex,
-        source_length,
-    )
-    .unwrap();
+	let _ = write!(
+		header,
+		"{} {}\nContent-Type: text/tmkup\nContent-Length: {}\nContent-Range: bytes {}-{}/{}\nFILE-SHA256: {}\nSOURCE-CONTENT-LENGTH: {}\n",
+		TMUTP_VERSION,
+		OK,
+		body.len(),
+		start,
+		end,
+		source_length,
+		content.sha256_hex(),
+		source_length,
+	);
+	append_trailer(
+		&mut header,
+		announce_compression,
+		content_encoding,
+		modified,
+	);
 
-	if announce_compression {
-		writeln!(
-			header,
-			"Supported-Compression: {}",
-			SUPPORTED_COMPRESSION.join(", ")
-		)
-		.unwrap();
-	}
-
-	if let Some(alg) = content_encoding {
-		writeln!(header, "Content-Encoding: {}", alg).unwrap();
-	}
-
-	if let Some(modified) = modified {
-		let date: chrono::DateTime<chrono::Utc> = modified.into();
-
-		writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d")).unwrap();
-	}
-
-	header.push('\n');
-
-	let mut response = header.into_bytes();
-	response.extend_from_slice(&body);
-
-	response
+	assemble(header, &body)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn make_file_response(
-	content: &[u8],
-	modified: Option<std::time::SystemTime>,
+	content: &FileBody,
+	modified: Option<SystemTime>,
 	compression: Option<&str>,
 	compression_minimum: usize,
-	cache_dir: &std::path::Path,
-	source_path: &std::path::Path,
+	cache_dir: &Path,
 	announce_compression: bool,
-	file_sha256_hex: Option<&str>,
 ) -> Vec<u8> {
 	let status = if content.is_empty() { OK_EMPTY } else { OK };
 
-	let hash_hex = match file_sha256_hex {
-		Some(hex) => hex.to_string(),
-		None => {
-			let mut s = String::new();
-			write!(s, "{:x}", sha2::Sha256::digest(content)).unwrap();
-			s
+	let compressed = match compression {
+		Some(alg) if content.len() >= compression_minimum => {
+			get_compressed_cached(cache_dir, content, alg, DiskCachePolicy::global())
+				.await
+				.map(|data| (data, alg))
 		}
+		_ => None,
 	};
 
-	let (body, content_encoding) = if let Some(alg) = compression {
-		if content.len() >= compression_minimum {
-			match get_compressed_cached(cache_dir, source_path, content, alg, true, u64::MAX).await
-			{
-				Some(data) => (data, Some(alg)),
-				None => (content.to_vec(), None),
-			}
-		} else {
-			(content.to_vec(), None)
-		}
-	} else {
-		(content.to_vec(), None)
+	let (body, content_encoding): (Bytes, Option<&str>) = match compressed {
+		Some((data, alg)) => (data, Some(alg)),
+		None => (content.bytes().clone(), None),
 	};
 
 	let mut header = String::new();
-	write!(
-        header,
-        "{} {}\nContent-Type: text/tmkup\nContent-Length: {}\nFILE-SHA256: {}\nSOURCE-CONTENT-LENGTH: {}\n",
-        TMUTP_VERSION,
-        status,
-        body.len(),
-        hash_hex,
-        content.len(),
-    )
-    .unwrap();
+	let _ = write!(
+		header,
+		"{} {}\nContent-Type: text/tmkup\nContent-Length: {}\nFILE-SHA256: {}\nSOURCE-CONTENT-LENGTH: {}\n",
+		TMUTP_VERSION,
+		status,
+		body.len(),
+		content.sha256_hex(),
+		content.len(),
+	);
+	append_trailer(
+		&mut header,
+		announce_compression,
+		content_encoding,
+		modified,
+	);
 
-	if announce_compression {
-		writeln!(
-			header,
-			"Supported-Compression: {}",
-			SUPPORTED_COMPRESSION.join(", ")
-		)
-		.unwrap();
-	}
-
-	if let Some(alg) = content_encoding {
-		writeln!(header, "Content-Encoding: {}", alg).unwrap();
-	}
-
-	if let Some(modified) = modified {
-		let date: chrono::DateTime<chrono::Utc> = modified.into();
-
-		writeln!(header, "Last-Modified: {}", date.format("%Y-%m-%d")).unwrap();
-	}
-
-	header.push('\n');
-
-	let mut response = header.into_bytes();
-	response.extend_from_slice(&body);
-
-	response
+	assemble(header, &body)
 }

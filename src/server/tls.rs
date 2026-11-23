@@ -1,4 +1,5 @@
 use crate::config::SecurityConfig;
+use crate::conn::harden_ssh_config;
 use anyhow::{Context, Result, anyhow};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -29,6 +30,8 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 		return Err(anyhow!("TLS certificate file contains no certificates"));
 	}
 
+	check_key_permissions(&security.tls_private_path, security.strict_key_permissions).await?;
+
 	let key_bytes = fs::read(&security.tls_private_path)
 		.await
 		.with_context(|| format!("cannot open TLS private key: {}", security.tls_private_path))?;
@@ -49,6 +52,8 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 pub async fn load_ssh_config(security: &SecurityConfig) -> Result<Arc<russh::server::Config>> {
 	let path = &security.ssh_host_key_path;
 
+	check_key_permissions(path, security.strict_key_permissions).await?;
+
 	let secret = fs::read_to_string(path)
 		.await
 		.with_context(|| format!("cannot load SSH host key: {path}"))?;
@@ -60,11 +65,48 @@ pub async fn load_ssh_config(security: &SecurityConfig) -> Result<Arc<russh::ser
 	// UTNP itself does not implement user authentication.
 	let mut methods = russh::MethodSet::empty();
 	methods.push(russh::MethodKind::None);
-	let config = russh::server::Config {
+	let mut config = russh::server::Config {
 		methods,
 		keys: vec![key],
 		..Default::default()
 	};
 
+	harden_ssh_config(&mut config);
+
 	Ok(Arc::new(config))
 }
+
+/// Приватный ключ не должен быть доступен группе и остальным (0600 на unix).
+/// По умолчанию только предупреждение; при `strict_key_permissions` — ошибка.
+pub async fn check_key_permissions(path: &str, strict: bool) -> Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+
+		let mode = fs::metadata(path)
+			.await
+			.with_context(|| format!("cannot stat private key: {path:?}"))?
+			.permissions()
+			.mode()
+			& 0o777;
+
+		if mode & 0o077 != 0 {
+			if strict {
+				return Err(anyhow!(
+					"private key {path:?} has insecure permissions {mode:o}, expected 600"
+				));
+			}
+
+			tracing::warn!(path = ?path, mode = format!("{mode:o}"), "private key is accessible by group/others, expected 600");
+		}
+	}
+
+	#[cfg(not(unix))]
+	let _ = (path, strict);
+
+	Ok(())
+}
+
+#[cfg(test)]
+#[path = "tls_tests.rs"]
+mod tests;

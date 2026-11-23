@@ -13,7 +13,13 @@ pub fn build_request(
 ) -> Result<Vec<u8>> {
 	let mut headers = Vec::with_capacity(custom_headers.len() + 4);
 
-	headers.push(("Host".to_string(), target.host.clone()));
+	let host_header = if target.host.contains(':') {
+		format!("[{}]", target.host)
+	} else {
+		target.host.clone()
+	};
+
+	headers.push(("Host".to_string(), host_header));
 	headers.push(("User-Agent".to_string(), "tcurl/0.1.0".to_string()));
 
 	let mut has_content_type = false;

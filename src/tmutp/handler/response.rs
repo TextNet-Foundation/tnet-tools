@@ -5,21 +5,19 @@ use std::path::{Path, PathBuf};
 
 pub fn make_version_error_response(version: &str, message: &str) -> Vec<u8> {
 	let mut body = String::new();
-	write!(
-        body,
-        "---tmk-meta\ntitle: \"51 Version not supported\"\n---tmk-meta\n\n# 51 Version not supported\n\n{}\n",
-        message
-    )
-    .unwrap();
+	let _ = write!(
+		body,
+		"---tmk-meta\ntitle: \"51 Version not supported\"\n---tmk-meta\n\n# 51 Version not supported\n\n{}\n",
+		message
+	);
 
 	let mut header = String::new();
-	write!(
+	let _ = write!(
 		header,
 		"{} 51 VERSION NOT SUPPORTED\nContent-Type: text/tmkup\nContent-Length: {}\n\n",
 		version,
 		body.len()
-	)
-	.unwrap();
+	);
 
 	let mut response = header.into_bytes();
 	response.extend_from_slice(body.as_bytes());
@@ -102,25 +100,23 @@ pub fn make_range_error_response(
 	};
 
 	let mut body = String::new();
-	write!(
+	let _ = write!(
 		body,
 		"---tmk-meta\ntitle: \"{}\"\n---tmk-meta\n\n# {}\n\n{}\n",
 		title, heading, message,
-	)
-	.unwrap();
+	);
 
 	let mut header = String::new();
-	write!(
-        header,
-        "{} {}\nContent-Type: text/tmkup\nContent-Length: {}\nSOURCE-CONTENT-LENGTH: {}\nRange-Error: {}; {}\n\n",
-        TMUTP_VERSION,
-        status,
-        body.len(),
-        source_length,
-        requested_range,
-        reason,
-    )
-    .unwrap();
+	let _ = write!(
+		header,
+		"{} {}\nContent-Type: text/tmkup\nContent-Length: {}\nSOURCE-CONTENT-LENGTH: {}\nRange-Error: {}; {}\n\n",
+		TMUTP_VERSION,
+		status,
+		body.len(),
+		source_length,
+		requested_range,
+		reason,
+	);
 
 	let mut response = header.into_bytes();
 	response.extend_from_slice(body.as_bytes());
@@ -130,14 +126,13 @@ pub fn make_range_error_response(
 
 pub fn make_response(status: &str, body: &[u8]) -> Vec<u8> {
 	let mut header = String::new();
-	write!(
+	let _ = write!(
 		header,
 		"{} {}\nContent-Type: text/tmkup\nContent-Length: {}\n\n",
 		TMUTP_VERSION,
 		status,
 		body.len()
-	)
-	.unwrap();
+	);
 
 	let mut response = header.into_bytes();
 	response.extend_from_slice(body);
@@ -150,25 +145,13 @@ pub fn make_empty_response() -> Vec<u8> {
 
 pub fn make_error_response(status: &str, title: &str, message: &str) -> Vec<u8> {
 	let mut body = String::new();
-	write!(
+	let _ = write!(
 		body,
 		"---tmk-meta\ntitle: \"{}\"\n---tmk-meta\n\n# {}\n\n{}\n\n[Back to main](/index.tmkup)",
 		title, title, message
-	)
-	.unwrap();
+	);
 
 	make_response(status, body.as_bytes())
-}
-
-pub fn find_header_end(raw: &[u8]) -> Option<usize> {
-	raw.windows(4)
-		.position(|window| window == b"\r\n\r\n")
-		.map(|position| position + 4)
-		.or_else(|| {
-			raw.windows(2)
-				.position(|window| window == b"\n\n")
-				.map(|position| position + 2)
-		})
 }
 
 pub fn replace_response_version(response: &mut Vec<u8>, version: &str) {
@@ -211,8 +194,8 @@ pub async fn serve_static_file(
 					compression,
 					compression_minimum,
 					accept_compression_present,
-					Some(cached.sha256_hex.as_str()),
-				);
+				)
+				.await;
 			}
 
 			compression::make_file_response(
@@ -221,11 +204,19 @@ pub async fn serve_static_file(
 				compression,
 				compression_minimum,
 				compression_cache,
-				&full_path,
 				accept_compression_present,
-				Some(cached.sha256_hex.as_str()),
 			)
 			.await
+		}
+
+		Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+			tracing::warn!(path = %full_path.display(), "file exceeds max_file_size");
+
+			make_error_response(
+				SERVER_ERROR,
+				"40 Server error",
+				"Requested file exceeds the server's max_file_size limit",
+			)
 		}
 
 		Err(error) => {
@@ -239,3 +230,7 @@ pub async fn serve_static_file(
 		}
 	}
 }
+
+#[cfg(test)]
+#[path = "response_tests.rs"]
+mod tests;

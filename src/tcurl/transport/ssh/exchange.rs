@@ -1,6 +1,6 @@
-use crate::transport::framing::expected_response_length;
+use crate::transport::framing::trim_and_check;
 use crate::transport::ssh::handler::KnownHostsHandler;
-use crate::types::{FrameKind, SshAttemptError};
+use crate::types::{FrameKind, MAX_UTNP_RESPONSE, Policy, SECURE_FAILED, SshAttemptError};
 use anyhow::anyhow;
 use bytes::Bytes;
 use russh::ChannelMsg;
@@ -9,11 +9,39 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+const RESPONSE_WAIT: Duration = Duration::from_secs(30);
+
+/// UTNP has no framing. The TextNet servers close the channel after the
+/// answer, and `Eof`/`Close` is the authoritative end marker. Only for a
+/// server that keeps the channel open we infer the end from this much silence
+/// after the last data (and warn that the answer might be cut).
+const UTNP_SILENCE: Duration = Duration::from_secs(3);
+
+/// Classifies a failure that happened before the server key was seen.
+///
+/// `ConnectionRefused` means that no SSH server listens here and is
+/// `Unavailable`. Any other failure (reset, EOF, timeout, a peer that does not
+/// speak SSH) could be an attacker forcing a downgrade, so it is `Failed`
+/// unless the user allowed insecure fallback.
+pub fn classify_connect_error(error: &russh::Error, allow_insecure: bool) -> SshAttemptError {
+	let refused = matches!(
+		error,
+		russh::Error::IO(io) if io.kind() == std::io::ErrorKind::ConnectionRefused
+	);
+
+	if refused || allow_insecure {
+		return SshAttemptError::Unavailable(error.to_string());
+	}
+
+	SshAttemptError::Failed(anyhow!("{SECURE_FAILED}: SSH connection failed: {error}"))
+}
+
 pub async fn exchange_ssh(
 	host: &str,
 	port: u16,
 	request: &[u8],
 	frame: FrameKind,
+	policy: Policy,
 ) -> std::result::Result<Vec<u8>, SshAttemptError> {
 	let key_checked = Arc::new(AtomicBool::new(false));
 	let key_trusted = Arc::new(AtomicBool::new(false));
@@ -31,7 +59,7 @@ pub async fn exchange_ssh(
 	};
 
 	let mut session = match tokio::time::timeout(
-		Duration::from_secs(15),
+		policy.connect_timeout,
 		client::connect(Arc::new(config), (host, port), handler),
 	)
 	.await
@@ -49,7 +77,7 @@ pub async fn exchange_ssh(
 				)));
 			}
 
-			return Err(SshAttemptError::Unavailable(error.to_string()));
+			return Err(classify_connect_error(&error, policy.allow_insecure));
 		}
 
 		Err(_) => {
@@ -59,9 +87,11 @@ pub async fn exchange_ssh(
 				)));
 			}
 
-			return Err(SshAttemptError::Unavailable(
-				"SSH connection timed out".to_string(),
-			));
+			return Err(if policy.allow_insecure {
+				SshAttemptError::Unavailable("SSH connection timed out".to_string())
+			} else {
+				SshAttemptError::Failed(anyhow!("{SECURE_FAILED}: SSH connection timed out"))
+			});
 		}
 	};
 
@@ -99,18 +129,22 @@ pub async fn exchange_ssh(
 		.map_err(|error| SshAttemptError::Failed(anyhow!("Cannot finish SSH request: {error}")))?;
 
 	let mut response = Vec::new();
+	let mut complete = false;
 
 	loop {
 		let wait_time = match frame {
-			FrameKind::Protocol { .. } => Duration::from_secs(30),
-			FrameKind::Utnp if response.is_empty() => Duration::from_secs(30),
-			FrameKind::Utnp => Duration::from_secs(1),
+			FrameKind::Utnp if !response.is_empty() => UTNP_SILENCE,
+			_ => RESPONSE_WAIT,
 		};
 
 		let message = match tokio::time::timeout(wait_time, channel.wait()).await {
 			Ok(message) => message,
 
 			Err(_) if matches!(frame, FrameKind::Utnp) && !response.is_empty() => {
+				eprintln!(
+					"WARN: SSH UTNP response end was inferred from {} s of silence; it may be incomplete",
+					UTNP_SILENCE.as_secs()
+				);
 				break;
 			}
 
@@ -122,11 +156,8 @@ pub async fn exchange_ssh(
 		};
 
 		match message {
+			// Only the data stream carries the response; stderr is ignored.
 			Some(ChannelMsg::Data { data }) => {
-				response.extend_from_slice(&data);
-			}
-
-			Some(ChannelMsg::ExtendedData { data, .. }) => {
 				response.extend_from_slice(&data);
 			}
 
@@ -137,14 +168,26 @@ pub async fn exchange_ssh(
 			Some(_) => {}
 		}
 
-		if let FrameKind::Protocol { head } = frame
-			&& let Some(expected) =
-				expected_response_length(&response, head).map_err(SshAttemptError::Failed)?
-			&& response.len() >= expected
-		{
-			break;
+		match frame {
+			FrameKind::Protocol { head } => {
+				complete = trim_and_check(&mut response, head).map_err(SshAttemptError::Failed)?;
+
+				if complete {
+					break;
+				}
+			}
+
+			FrameKind::Utnp if response.len() > MAX_UTNP_RESPONSE => {
+				return Err(SshAttemptError::Failed(anyhow!(
+					"UTNP response exceeds the size limit"
+				)));
+			}
+
+			FrameKind::Utnp => {}
 		}
 	}
+
+	let _ = channel.close().await;
 
 	if response.is_empty() {
 		return Err(SshAttemptError::Failed(anyhow!(
@@ -152,7 +195,15 @@ pub async fn exchange_ssh(
 		)));
 	}
 
-	let _ = channel.close().await;
+	if matches!(frame, FrameKind::Protocol { .. }) && !complete {
+		return Err(SshAttemptError::Failed(anyhow!(
+			"SSH channel closed before the response was complete"
+		)));
+	}
 
 	Ok(response)
 }
+
+#[cfg(test)]
+#[path = "exchange_tests.rs"]
+mod tests;

@@ -30,6 +30,15 @@ pub struct Args {
 	#[arg(long, global = true)]
 	pub verify_for_sni: Option<String>,
 
+	/// Разрешить откат на незашифрованный TCP, если SSH/TLS установить не
+	/// удалось. Без флага это ошибка. --v1 по-прежнему явно выбирает TCP.
+	#[arg(long = "allow-insecure-fallback", global = true)]
+	pub allow_insecure_fallback: bool,
+
+	/// Таймаут подключения и рукопожатия, секунды.
+	#[arg(long, default_value_t = 15, global = true)]
+	pub timeout: u64,
+
 	#[command(subcommand)]
 	pub command: Command,
 }

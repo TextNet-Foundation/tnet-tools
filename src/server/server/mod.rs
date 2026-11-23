@@ -3,19 +3,20 @@ pub mod dispatch;
 pub mod stream;
 
 use crate::config::{self, AppState, Args, Config};
+use crate::conn::ServerLimits;
 use crate::tls;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 
 pub async fn run() -> Result<()> {
 	let args = Args::parse();
 
 	let config_content = tokio::fs::read_to_string(&args.config)
 		.await
-		.with_context(|| format!("cannot read config file: {}", args.config))?;
+		.with_context(|| format!("cannot read config file: {:?}", args.config))?;
 
 	let config: Config = toml::from_str(&config_content).context("invalid UTNP config")?;
 
@@ -58,9 +59,11 @@ pub async fn run() -> Result<()> {
 		require_secure: config.security.require_secure,
 	};
 
-	let listener = TcpListener::bind(("0.0.0.0", config.port)).await?;
+	let listener = TcpListener::bind((config.bind_address.as_str(), config.port))
+		.await
+		.with_context(|| format!("cannot bind {}:{}", config.bind_address, config.port))?;
 
-	tracing::info!(port = config.port, "UTNP server listening");
+	tracing::info!(bind = ?config.bind_address, port = config.port, "UTNP server listening");
 	tracing::info!(protocols = state.protocols.len(), "loaded protocols");
 	tracing::info!(
 		support_first_version = state.support_first_version,
@@ -77,35 +80,15 @@ pub async fn run() -> Result<()> {
 		tracing::info!("SSH authentication: none (transport only)");
 	}
 
-	let semaphore = Arc::new(Semaphore::new(256));
+	let limits = ServerLimits {
+		max_connections: config.max_connections,
+		max_per_ip: config.max_connections_per_ip,
+		max_connection: Duration::from_secs(config.max_connection_secs),
+	};
 
-	loop {
-		tokio::select! {
-			_ = tokio::signal::ctrl_c() => {
-				tracing::info!("UTNP server shutting down");
-				break;
-			}
-			accept_result = listener.accept() => {
-				let (stream, peer) = match accept_result {
-					Ok(v) => v,
-					Err(error) => {
-						tracing::error!(error = %error, "accept error");
-						continue;
-					}
-				};
+	accept::run_accept_loop(listener, state, tls_acceptor, ssh_config, limits).await?;
 
-				accept::handle_accepted(
-					stream,
-					peer,
-					state.clone(),
-					tls_acceptor.clone(),
-					ssh_config.clone(),
-					semaphore.clone(),
-				)
-				.await;
-			}
-		}
-	}
+	tracing::info!("UTNP server stopped");
 
 	Ok(())
 }
