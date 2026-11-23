@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
+mod native_roots;
 mod ssh;
 mod tcp;
 mod tls;

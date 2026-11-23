@@ -1,4 +1,6 @@
-use crate::common::{DiskCachePolicy, FileBody, compress_blocking, get_compressed_cached};
+use crate::common::{
+	DiskCachePolicy, FileBody, get_compressed_cached, get_compressed_range_cached,
+};
 use crate::config::{
 	INVALID_RANGE, OK, OK_EMPTY, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION, TMUTP_VERSION,
 	UNSUPPORTED_RANGE,
@@ -96,7 +98,7 @@ pub async fn make_range_response(
 
 	let compressed = match compression {
 		Some(alg) if range_content.len() >= compression_minimum => {
-			compress_blocking(range_content.clone(), alg)
+			get_compressed_range_cached(content, start, end, alg)
 				.await
 				.map(|data| (data, alg))
 		}

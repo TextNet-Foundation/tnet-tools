@@ -1,4 +1,4 @@
-use crate::common::{ParseResult, parse_request, resolve_path, script_extensions};
+use crate::common::{ParseResult, parse_request, resolve_path_cached_root, script_extensions};
 use crate::config::{
 	AppState, BAD_REQUEST, FORBIDDEN, METHOD_NOT_ALLOWED, NOT_FOUND, SERVER_ERROR,
 	TBIP_FIRST_VERSION, TBIP_VERSION,
@@ -132,7 +132,7 @@ async fn process_request_inner(parsed: &crate::common::ParsedRequest, state: &Ap
 	match tokio::task::spawn_blocking({
 		let root = state.root.clone();
 		let p = request_path.clone();
-		move || resolve_path(&root, &p, &script_exts)
+		move || resolve_path_cached_root(&root, &p, &script_exts)
 	})
 	.await
 	.unwrap_or_else(|_| Err(io::Error::other("join error")))

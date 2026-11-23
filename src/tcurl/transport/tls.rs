@@ -1,15 +1,14 @@
 use crate::transport::tcp::send_and_receive;
 use crate::types::{AttemptError, FrameKind, Policy, classify_io_error};
 use anyhow::anyhow;
-use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::rustls::ClientConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 
 pub async fn exchange_tls(
 	host: &str,
@@ -20,47 +19,43 @@ pub async fn exchange_tls(
 	verify_for_sni: Option<&str>,
 	policy: Policy,
 ) -> std::result::Result<Vec<u8>, AttemptError> {
-	let mut roots = RootCertStore::empty();
+	// System root certificates: parsed once per process.
+	let native_roots = super::native_roots::native_root_store()
+		.map_err(|message| anyhow!(message))
+		.map_err(AttemptError::Fatal)?;
 
-	let native_certs = rustls_native_certs::load_native_certs();
-
-	for error in &native_certs.errors {
-		tracing::warn!(error = %error, "cannot load system CA certificate");
-	}
-
-	for cert in native_certs.certs {
-		roots
-			.add(cert)
-			.map_err(anyhow::Error::from)
-			.map_err(AttemptError::Fatal)?;
-	}
-
-	if let Some(path) = ca_cert {
-		let bytes = fs::read(path)
-			.await
-			.map_err(anyhow::Error::from)
-			.map_err(AttemptError::Fatal)?;
-
-		let mut reader = Cursor::new(bytes);
-
-		let certificates: Vec<_> = rustls_pemfile::certs(&mut reader)
-			.collect::<std::result::Result<_, _>>()
-			.map_err(anyhow::Error::from)
-			.map_err(AttemptError::Fatal)?;
-
-		if certificates.is_empty() {
-			return Err(AttemptError::Fatal(anyhow!(
-				"CA certificate file contains no certificates"
-			)));
-		}
-
-		for certificate in certificates {
-			roots
-				.add(certificate)
+	// An extra user CA is added on top of a copy of the shared store.
+	let roots = match ca_cert {
+		None => native_roots,
+		Some(path) => {
+			let bytes = fs::read(path)
+				.await
 				.map_err(anyhow::Error::from)
 				.map_err(AttemptError::Fatal)?;
+
+			let certificates: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
+				.collect::<std::result::Result<_, _>>()
+				.map_err(anyhow::Error::from)
+				.map_err(AttemptError::Fatal)?;
+
+			if certificates.is_empty() {
+				return Err(AttemptError::Fatal(anyhow!(
+					"CA certificate file contains no certificates"
+				)));
+			}
+
+			let mut roots = (*native_roots).clone();
+
+			for certificate in certificates {
+				roots
+					.add(certificate)
+					.map_err(anyhow::Error::from)
+					.map_err(AttemptError::Fatal)?;
+			}
+
+			Arc::new(roots)
 		}
-	}
+	};
 
 	if roots.is_empty() {
 		return Err(AttemptError::Fatal(anyhow!(

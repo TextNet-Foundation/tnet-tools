@@ -18,9 +18,11 @@
 //!   and on the canonical target (so a symlink alias cannot bypass it).
 
 use percent_encoding::percent_decode_str;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 pub const MAX_HEADERS: usize = 100;
 pub const MAX_HEADER_LINE: usize = 8192;
@@ -170,12 +172,51 @@ fn map_path_error(error: PathError) -> Error {
 ///
 /// `Ok(None)` = not found or hidden by policy; `PermissionDenied` = outside
 /// root or script source. The input is collapsed again but never decoded again.
+#[cfg(test)]
 pub fn resolve_path(
 	root: &str,
 	path: &str,
 	script_exts: &[String],
 ) -> std::io::Result<Option<PathBuf>> {
 	let canonical_root = fs::canonicalize(root)?;
+	resolve_path_in(&canonical_root, path, script_exts)
+}
+
+/// Canonical form of each seen root, computed once per process. A server binds
+/// its root at startup, so re-canonicalizing it on every request is pure cost.
+static CANONICAL_ROOTS: LazyLock<Mutex<HashMap<String, PathBuf>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn canonical_root_cached(root: &str) -> std::io::Result<PathBuf> {
+	let mut cache = CANONICAL_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+
+	if let Some(cached) = cache.get(root) {
+		return Ok(cached.clone());
+	}
+
+	let canonical = fs::canonicalize(root)?;
+	cache.insert(root.to_owned(), canonical.clone());
+	Ok(canonical)
+}
+
+/// [`resolve_path`] with the canonical root cached per process: identical
+/// verdicts, one `canonicalize(root)` syscall saved per request.
+pub fn resolve_path_cached_root(
+	root: &str,
+	path: &str,
+	script_exts: &[String],
+) -> std::io::Result<Option<PathBuf>> {
+	let canonical_root = canonical_root_cached(root)?;
+	resolve_path_in(&canonical_root, path, script_exts)
+}
+
+/// Same as [`resolve_path`], but for a root that is already canonicalized
+/// (e.g. cached once in server state), so it is not re-canonicalized per request.
+pub fn resolve_path_in(
+	canonical_root: &Path,
+	path: &str,
+	script_exts: &[String],
+) -> std::io::Result<Option<PathBuf>> {
 	let (mut parts, is_directory) = segments(path).map_err(map_path_error)?;
 
 	if is_directory {
@@ -189,25 +230,21 @@ pub fn resolve_path(
 		Verdict::Script => return Err(denied("Script sources are not served")),
 	}
 
-	let mut current = canonical_root.clone();
+	let mut current = canonical_root.to_path_buf();
 
 	for (index, part) in parts.iter().enumerate() {
 		current.push(part);
 
-		match fs::symlink_metadata(&current) {
-			Ok(_) => {}
-			Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-			Err(error) => return Err(error),
-		}
-
-		// Dangling symlinks and symlink loops count as missing, never as a read.
+		// Canonicalize alone distinguishes "missing" from other errors exactly
+		// like symlink_metadata did: a missing component, a dangling symlink and
+		// a broken tail all surface as NotFound here and count as missing.
 		current = match fs::canonicalize(&current) {
 			Ok(canonical) => canonical,
 			Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
 			Err(error) => return Err(error),
 		};
 
-		if !current.starts_with(&canonical_root) {
+		if !current.starts_with(canonical_root) {
 			return Err(denied("Path is outside root"));
 		}
 
@@ -221,7 +258,7 @@ pub fn resolve_path(
 	}
 
 	let relative = current
-		.strip_prefix(&canonical_root)
+		.strip_prefix(canonical_root)
 		.map_err(|_| denied("Path is outside root"))?;
 	let names: Vec<String> = relative
 		.components()

@@ -1,6 +1,6 @@
 use crate::common::frame::DEFAULT_MAX_BODY;
 use crate::common::negotiate_compression;
-use crate::common::{ParseResult, parse_request, resolve_path, script_extensions};
+use crate::common::{ParseResult, parse_request, resolve_path_cached_root, script_extensions};
 use crate::config::*;
 use crate::handler::response::*;
 use crate::script_engine::Request;
@@ -112,7 +112,7 @@ async fn process_request_inner(parsed: &crate::common::ParsedRequest, state: &Ap
 	match tokio::task::spawn_blocking({
 		let root = state.root.clone();
 		let p = request_path.clone();
-		move || resolve_path(&root, &p, &script_exts)
+		move || resolve_path_cached_root(&root, &p, &script_exts)
 	})
 	.await
 	.unwrap_or_else(|_| Err(io::Error::other("join error")))
