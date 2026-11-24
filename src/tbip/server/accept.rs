@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
@@ -27,8 +28,7 @@ pub async fn run() -> Result<()> {
 		.await
 		.with_context(|| format!("Failed to read config: {}", args.config))?;
 
-	let config: Config = toml::from_str(&config_content).context("Failed to parse TBIP config")?;
-	let config = config.normalized(&args.config)?;
+	let config = Config::prepare(&config_content, &args.config)?;
 
 	let lua_engine = if config.scripting.enabled {
 		let ext = config
@@ -84,17 +84,6 @@ pub async fn run() -> Result<()> {
 		None
 	};
 
-	if config.compression_cache_enable {
-		tokio::fs::create_dir_all(&config.compression_cache)
-			.await
-			.with_context(|| {
-				format!(
-					"Cannot create compression cache directory: {}",
-					config.compression_cache
-				)
-			})?;
-	}
-
 	let state = AppState {
 		root: config.root.clone(),
 		lua_engine,
@@ -147,7 +136,11 @@ pub async fn run() -> Result<()> {
 		"The server is at its connection limit",
 	);
 
-	let limits = ServerLimits::default();
+	let limits = ServerLimits {
+		max_connections: config.max_connections,
+		max_per_ip: config.max_connections_per_ip,
+		max_connection: Duration::from_secs(config.max_connection_secs),
+	};
 
 	serve(listener, &limits, &busy_reply, move |stream, peer| {
 		let state = state.clone();

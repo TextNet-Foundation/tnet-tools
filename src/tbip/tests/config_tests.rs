@@ -69,3 +69,29 @@ fn normalized_rejects_bad_values_and_cache_inside_root() {
 	assert!(bad_bind.normalized(config_path).is_err());
 	let _ = std::fs::remove_dir_all(base);
 }
+
+#[test]
+fn limits_have_defaults_and_are_validated() {
+	let config: Config = toml::from_str("port = 81\nroot = \"./www\"\n").unwrap();
+	assert_eq!(config.max_connections, 256);
+	assert_eq!(config.max_connections_per_ip, 32);
+	assert_eq!(config.max_connection_secs, 3600);
+
+	let base = std::env::temp_dir().join(format!("tnet-tbip-lim-{}", std::process::id()));
+	let root = base.join("www");
+	std::fs::create_dir_all(&root).unwrap();
+	let config_path = base.join("config.toml");
+	let config_path = config_path.to_str().unwrap();
+
+	for extra in [
+		"max_connections = 0\n",
+		"max_connections_per_ip = 0\n",
+		"max_connection_secs = 0\n",
+		"max_connections = 99999999\n",
+	] {
+		let text = format!("port = 81\nroot = \"{}\"\n{extra}", root.display());
+		let config: Config = toml::from_str(&text).unwrap();
+		assert!(config.normalized(config_path).is_err(), "{extra}");
+	}
+	let _ = std::fs::remove_dir_all(base);
+}

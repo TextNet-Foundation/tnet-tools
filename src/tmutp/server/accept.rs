@@ -1,10 +1,13 @@
+use crate::common::DiskCachePolicy;
 use crate::common::conn::{ServerLimits, harden_ssh_config, serve};
 use crate::config::*;
 use crate::handler::make_error_response;
 use crate::server::dispatch_connection;
 use anyhow::Context;
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -22,8 +25,7 @@ pub async fn run() -> anyhow::Result<()> {
 		.await
 		.with_context(|| format!("Failed to read config: {}", args.config))?;
 
-	let config: Config = toml::from_str(&config_content).context("Failed to parse TMUTP config")?;
-	let config = config.normalized(&args.config)?;
+	let config = Config::prepare(&config_content, &args.config)?;
 
 	let lua_engine = if config.scripting.enabled {
 		let ext = config
@@ -79,24 +81,6 @@ pub async fn run() -> anyhow::Result<()> {
 		None
 	};
 
-	let compression_cache = {
-		let p = std::path::PathBuf::from(&config.compression_cache);
-		if p.is_absolute() {
-			p
-		} else {
-			std::path::PathBuf::from(&config.root).join(p)
-		}
-	};
-
-	tokio::fs::create_dir_all(&compression_cache)
-		.await
-		.with_context(|| {
-			format!(
-				"Cannot create compression cache directory: {}",
-				compression_cache.display()
-			)
-		})?;
-
 	let state = AppState {
 		root: config.root.clone(),
 		lua_engine,
@@ -105,7 +89,14 @@ pub async fn run() -> anyhow::Result<()> {
 		require_secure: config.security.require_secure,
 		support_first_version: config.support_first_version,
 		compression_minimum: config.compression_minimum,
-		compression_cache,
+		max_body: config.max_body,
+		compression_cache: DiskCache {
+			dir: PathBuf::from(&config.compression_cache),
+			policy: DiskCachePolicy {
+				enable: config.compression_cache_enable,
+				source_maximum: config.compression_cache_source_maximum,
+			},
+		},
 	};
 
 	let listener = TcpListener::bind((config.bind_address.as_str(), config.port)).await?;
@@ -124,7 +115,7 @@ pub async fn run() -> anyhow::Result<()> {
 		"Compression: {} (minimum {} bytes, cache {})",
 		SUPPORTED_COMPRESSION.join(", "),
 		state.compression_minimum,
-		state.compression_cache.display(),
+		state.compression_cache.dir.display(),
 	);
 
 	if config.scripting.enabled {
@@ -148,7 +139,11 @@ pub async fn run() -> anyhow::Result<()> {
 		"The server is at its connection limit",
 	);
 
-	let limits = ServerLimits::default();
+	let limits = ServerLimits {
+		max_connections: config.max_connections,
+		max_per_ip: config.max_connections_per_ip,
+		max_connection: Duration::from_secs(config.max_connection_secs),
+	};
 
 	serve(listener, &limits, &busy_reply, move |stream, peer| {
 		let state = state.clone();

@@ -69,3 +69,55 @@ fn security_rejects_unknown_keys() {
 	let typo: Result<SecurityConfig, _> = toml::from_str("requre_secure = true");
 	assert!(typo.is_err());
 }
+
+#[test]
+fn limits_are_validated() {
+	assert!(validate_limits(256, 32, 3600).is_ok());
+	assert!(validate_limits(0, 32, 3600).is_err());
+	assert!(validate_limits(256, 0, 3600).is_err());
+	assert!(validate_limits(256, 32, 0).is_err());
+	assert!(validate_limits(10_000_000, 32, 3600).is_err());
+	assert!(validate_limits(256, 32, u64::MAX).is_err());
+}
+
+#[test]
+fn strict_key_permissions_default_to_true() {
+	assert!(SecurityConfig::default().strict_key_permissions);
+	let parsed: SecurityConfig = toml::from_str("require_secure = true").unwrap();
+	assert!(parsed.strict_key_permissions);
+}
+
+#[cfg(unix)]
+#[test]
+fn exposed_key_is_refused_when_strict() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let path = std::env::temp_dir().join(format!("tnet-sc-key-{}", std::process::id()));
+	std::fs::write(&path, b"key").unwrap();
+
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+	assert!(check_key_permissions(&path, "test key", true).is_err());
+	assert!(check_key_permissions(&path, "test key", false).is_ok());
+
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+	assert!(check_key_permissions(&path, "test key", true).is_ok());
+	let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn load_ssh_config_refuses_world_readable_host_key_by_default() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let path = std::env::temp_dir().join(format!("tnet-sc-ssh-{}", std::process::id()));
+	std::fs::write(&path, b"not a key").unwrap();
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+	let security = SecurityConfig {
+		ssh_host_key_path: path.to_string_lossy().into_owned(),
+		..SecurityConfig::default()
+	};
+	let error = load_ssh_config(&security).unwrap_err().to_string();
+	assert!(error.contains("insecure permissions"), "{error}");
+	let _ = std::fs::remove_file(path);
+}

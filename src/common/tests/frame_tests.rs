@@ -1,5 +1,7 @@
 use super::*;
 
+const DEFAULT_MAX_BODY: usize = 16 * 1024 * 1024;
+
 fn poll_all(data: &[u8], max_body: usize) -> Frame {
 	FrameParser::new(max_body).poll(data)
 }
@@ -172,4 +174,28 @@ fn split_terminator_across_chunks() {
 	let mut parser = FrameParser::new(0);
 	assert_eq!(parser.poll(b"GET / TBIP/2.0\r\n\r"), Frame::Incomplete);
 	assert_eq!(parser.poll(b"GET / TBIP/2.0\r\n\r\n"), Frame::Complete(18));
+}
+
+#[test]
+fn transfer_encoding_is_rejected_before_the_body() {
+	for name in [
+		"Transfer-Encoding",
+		"transfer-encoding",
+		"TRANSFER-ENCODING",
+		" Transfer-Encoding ",
+	] {
+		let data = format!("POST / TMUTP/2.0\nContent-Length: 5\n{name}: chunked\n\n");
+		assert_eq!(
+			poll_all(data.as_bytes(), 100),
+			Frame::Invalid(FrameError::TransferEncodingUnsupported),
+			"{name}"
+		);
+	}
+
+	let alone = b"POST / TMUTP/2.0\r\nTransfer-Encoding: chunked\r\n\r\n";
+	assert_eq!(
+		poll_all(alone, 100),
+		Frame::Invalid(FrameError::TransferEncodingUnsupported)
+	);
+	assert!(!FrameError::TransferEncodingUnsupported.message().is_empty());
 }

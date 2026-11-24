@@ -34,6 +34,12 @@ pub async fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
 		ParseResult::Forbidden => return forbidden_response(),
 	};
 
+	// TBIP requests carry no body (the frame parser already enforces it); a body here
+	// would mean the framing and this handler disagree, so refuse instead of ignoring.
+	if !parsed.body.is_empty() {
+		return bad_request("TBIP requests must not have a body");
+	}
+
 	let response_version = match parsed.version.as_str() {
 		"TBIP/2.0" => TBIP_VERSION,
 		"TBIP/1.0" if state.support_first_version => TBIP_FIRST_VERSION,

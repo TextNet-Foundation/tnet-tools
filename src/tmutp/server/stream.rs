@@ -1,5 +1,5 @@
 use crate::common::conn::{read_idle, write_response};
-use crate::common::frame::{DEFAULT_MAX_BODY, Frame, FrameParser};
+use crate::common::frame::{Frame, FrameParser};
 use crate::config::*;
 use crate::handler::{make_error_response, process_request};
 use anyhow::Result;
@@ -23,7 +23,7 @@ where
 	S: AsyncRead + AsyncWrite + Unpin,
 {
 	let mut buffer: Vec<u8> = Vec::new();
-	let mut parser = FrameParser::new(DEFAULT_MAX_BODY);
+	let mut parser = FrameParser::new(state.max_body);
 	let mut chunk = [0u8; 16 * 1024];
 
 	loop {

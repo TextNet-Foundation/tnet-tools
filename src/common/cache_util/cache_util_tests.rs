@@ -95,3 +95,19 @@ fn lock_unpoisoned_survives_panic() {
 	.join();
 	assert_eq!(*lock_unpoisoned(&mutex), 1);
 }
+
+#[test]
+fn weighted_lru_zero_weight_entries_are_capped() {
+	let mut cache: WeightedLru<u32, u32> = WeightedLru::new(1_000_000);
+
+	for key in 0..200_000u32 {
+		cache.put(key, key, 0);
+	}
+
+	let kept = (0..200_000u32)
+		.filter(|key| cache.get(key).is_some())
+		.count();
+	assert!(kept <= weighted_lru::MAX_ENTRIES);
+	assert!(cache.get(&0).is_none());
+	assert!(cache.get(&199_999).is_some());
+}

@@ -73,7 +73,7 @@ pub fn decode(record: Vec<u8>, source: &[u8; 32]) -> Result<Bytes, &'static str>
 pub async fn read(dir: &Path, content: &FileBody, alg: &str) -> Option<Bytes> {
 	let path = record_path(dir, content.sha256_hex(), alg);
 
-	let mut file = match tokio::fs::File::open(&path).await {
+	let file = match tokio::fs::File::open(&path).await {
 		Ok(file) => file,
 		Err(error) => {
 			if error.kind() != io::ErrorKind::NotFound {
@@ -83,11 +83,26 @@ pub async fn read(dir: &Path, content: &FileBody, alg: &str) -> Option<Bytes> {
 		}
 	};
 
-	let modified = file.metadata().await.ok().and_then(|m| m.modified().ok());
+	let metadata = file.metadata().await.ok();
+	let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+	let max = max_record_len(content.len());
+
+	// Incompressible data is slightly larger than the source; anything beyond that
+	// is not a record this server wrote.
+	if metadata.is_some_and(|m| m.len() > max as u64) {
+		discard_invalid(&path, modified, "record too large").await;
+		return None;
+	}
+
 	let mut record = Vec::new();
 
-	if let Err(error) = file.read_to_end(&mut record).await {
+	if let Err(error) = file.take(max as u64 + 1).read_to_end(&mut record).await {
 		tracing::debug!(path = %path.display(), error = %error, "cache read failed");
+		return None;
+	}
+
+	if record.len() > max {
+		discard_invalid(&path, modified, "record too large").await;
 		return None;
 	}
 
@@ -97,17 +112,30 @@ pub async fn read(dir: &Path, content: &FileBody, alg: &str) -> Option<Bytes> {
 	match run_cpu(len, move || decode(record, &source)).await? {
 		Ok(body) => Some(body),
 		Err(reason) => {
-			let stale = modified
-				.and_then(|m| m.elapsed().ok())
-				.is_none_or(|age| age >= FRESH_GRACE);
-
-			tracing::warn!(path = %path.display(), reason, removing = stale, "ignoring invalid cache record");
-
-			if stale {
-				let _ = tokio::fs::remove_file(&path).await;
-			}
+			discard_invalid(&path, modified, reason).await;
 			None
 		}
+	}
+}
+
+/// Largest plausible record for a source of `source_len` bytes.
+fn max_record_len(source_len: usize) -> usize {
+	HEADER_LEN
+		.saturating_add(source_len)
+		.saturating_add(source_len / 8)
+		.saturating_add(4096)
+}
+
+/// Logs an invalid record and removes it unless it is fresh.
+async fn discard_invalid(path: &Path, modified: Option<std::time::SystemTime>, reason: &str) {
+	let stale = modified
+		.and_then(|m| m.elapsed().ok())
+		.is_none_or(|age| age >= FRESH_GRACE);
+
+	tracing::warn!(path = %path.display(), reason, removing = stale, "ignoring invalid cache record");
+
+	if stale {
+		let _ = tokio::fs::remove_file(path).await;
 	}
 }
 
@@ -149,3 +177,7 @@ async fn write_and_rename(tmp: &Path, target: &Path, record: &[u8]) -> io::Resul
 
 	tokio::fs::rename(tmp, target).await
 }
+
+#[cfg(test)]
+#[path = "disk_tests.rs"]
+mod tests;

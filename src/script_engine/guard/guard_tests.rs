@@ -49,9 +49,12 @@ fn unknown_status_is_rejected_and_valid_response_passes() {
 	assert!(validate_response(&ok, known).is_ok());
 }
 
-struct Sleeper;
+const GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
-impl ScriptEngine for Sleeper {
+/// Скрипт, который «работает» заданное время и игнорирует дедлайн (как долгая C-функция).
+struct Blocker(u64);
+
+impl ScriptEngine for Blocker {
 	fn has_script(&self, _: &str) -> bool {
 		true
 	}
@@ -62,19 +65,13 @@ impl ScriptEngine for Sleeper {
 		_: &Request,
 		_: &crate::script_engine::ScriptLimits,
 	) -> Result<Option<Response>, String> {
-		std::thread::sleep(std::time::Duration::from_millis(400));
+		std::thread::sleep(std::time::Duration::from_millis(self.0));
 		Ok(None)
 	}
 }
 
-#[tokio::test]
-async fn exhausted_slots_yield_busy_instead_of_hanging() {
-	let config = ScriptingConfig {
-		max_concurrent: Some(1),
-		queue_timeout_ms: Some(50),
-		..ScriptingConfig::default()
-	};
-	let request = Request {
+fn test_request() -> Request {
+	Request {
 		protocol: "tmutp".into(),
 		method: "GET".into(),
 		path: "/".into(),
@@ -82,16 +79,70 @@ async fn exhausted_slots_yield_busy_instead_of_hanging() {
 		body: Vec::new(),
 		form: HashMap::new(),
 		headers: HashMap::new(),
-	};
+	}
+}
 
-	let engine: Arc<dyn ScriptEngine> = Arc::new(Sleeper);
+fn config(timeout_ms: u64, queue_timeout_ms: u64) -> ScriptingConfig {
+	ScriptingConfig {
+		max_concurrent: Some(1),
+		queue_timeout_ms: Some(queue_timeout_ms),
+		timeout_ms: Some(timeout_ms),
+		..ScriptingConfig::default()
+	}
+}
+
+#[tokio::test]
+async fn hung_script_returns_error_fast_but_keeps_slot() {
+	// Свой семафор: ничего не зависит от глобального состояния и других тестов.
+	let slots = Arc::new(Semaphore::new(1));
+	let config = config(100, 50);
+	let engine: Arc<dyn ScriptEngine> = Arc::new(Blocker(900));
+
+	let started = std::time::Instant::now();
+	let first = run_script_in(
+		&slots,
+		GRACE,
+		engine.clone(),
+		"/".into(),
+		test_request(),
+		&config,
+	)
+	.await;
+	let elapsed = started.elapsed();
+
+	// Клиент получил ошибку по таймауту (~200 мс), раньше чем поток закончил (900 мс).
+	assert!(matches!(first, Err(RunError::Failed(_))));
+	assert!(
+		elapsed < std::time::Duration::from_millis(700),
+		"{elapsed:?}"
+	);
+
+	// Поток ещё работает: слот занят.
+	let second = run_script_in(&slots, GRACE, engine, "/".into(), test_request(), &config).await;
+	assert!(matches!(second, Err(RunError::Busy)));
+
+	// После завершения потока слот освобождается: ждём его самого, а не угадываем время.
+	let free = tokio::time::timeout(
+		std::time::Duration::from_secs(5),
+		slots.clone().acquire_owned(),
+	)
+	.await;
+	assert!(free.is_ok(), "slot was never released");
+}
+
+#[tokio::test]
+async fn exhausted_slots_yield_busy_instead_of_hanging() {
+	let slots = Arc::new(Semaphore::new(1));
+	let config = config(5_000, 50);
+	let engine: Arc<dyn ScriptEngine> = Arc::new(Blocker(400));
+
 	let first = tokio::spawn({
-		let (engine, request, config) = (engine.clone(), request.clone(), config.clone());
-		async move { run_script(engine, "/".into(), request, &config).await }
+		let (slots, engine, config) = (slots.clone(), engine.clone(), config.clone());
+		async move { run_script_in(&slots, GRACE, engine, "/".into(), test_request(), &config).await }
 	});
 	tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-	let second = run_script(engine, "/".into(), request, &config).await;
+	let second = run_script_in(&slots, GRACE, engine, "/".into(), test_request(), &config).await;
 	assert!(matches!(second, Err(RunError::Busy)));
 	assert!(matches!(first.await.expect("join"), Ok(None)));
 }

@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<ExitCode> {
 			output: &args.output,
 			output_header: &args.output_header,
 			output_on_error: args.output_on_error,
+			raw: args.raw,
 		},
 	)
 	.await?;

@@ -1,7 +1,7 @@
 use super::*;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod helpers;
+mod patterns;
 
 const DEFAULT_EXTENSION: &str = ".script.lua";
 
@@ -103,6 +104,7 @@ impl ScriptEngine for LuaEngine {
 		let lua = helpers::new_sandboxed(limits)?;
 		helpers::register_responses(&lua)?;
 		helpers::register_files(&lua, &self.sandbox)?;
+		patterns::restrict_patterns(&lua)?;
 
 		lua.load(&*script).exec().map_err(|e| e.to_string())?;
 

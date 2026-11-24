@@ -1,4 +1,3 @@
-use crate::common::frame::DEFAULT_MAX_BODY;
 use crate::common::negotiate_compression;
 use crate::common::{ParseResult, parse_request, resolve_path_cached_root, script_extensions};
 use crate::config::*;
@@ -22,7 +21,7 @@ fn forbidden_response() -> Vec<u8> {
 }
 
 pub async fn process_request(raw: &[u8], state: &AppState) -> Vec<u8> {
-	let parsed = match parse_request(raw, DEFAULT_MAX_BODY) {
+	let parsed = match parse_request(raw, state.max_body) {
 		ParseResult::Ok(p) => p,
 		ParseResult::BadRequest(msg) => return bad_request(msg),
 		ParseResult::Forbidden => return forbidden_response(),
@@ -155,5 +154,5 @@ async fn process_request_inner(parsed: &crate::common::ParsedRequest, state: &Ap
 }
 
 #[cfg(test)]
-#[path = "request_tests.rs"]
+#[path = "tests/request_tests.rs"]
 mod tests;

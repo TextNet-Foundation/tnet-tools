@@ -48,7 +48,6 @@ pub async fn exchange_with_fallback(
 	args: &Args,
 ) -> anyhow::Result<Exchanged> {
 	let policy = policy_from_args(args);
-	#[allow(unused_assignments)]
 	let mut reason = String::from("no secure transport was attempted");
 
 	if matches!(mode, TransportMode::SshThenTlsThenTcp) {
@@ -129,5 +128,5 @@ pub async fn exchange_with_fallback(
 }
 
 #[cfg(test)]
-#[path = "mod_tests.rs"]
+#[path = "tests/mod_tests.rs"]
 mod tests;

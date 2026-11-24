@@ -20,9 +20,6 @@ pub struct ParsedRequest {
 	pub path: String,
 	pub query: HashMap<String, String>,
 	pub headers: HashMap<String, String>,
-	#[allow(dead_code)]
-	pub content_length: usize,
-	#[allow(dead_code)]
 	pub body: Vec<u8>,
 }
 
@@ -50,6 +47,28 @@ pub fn parse_fields(input: &str) -> Option<HashMap<String, String>> {
 	}
 
 	Some(fields)
+}
+
+/// Longest client-supplied value echoed back in a response header.
+pub const MAX_ECHOED_HEADER: usize = 200;
+
+/// Makes a client-supplied string safe to put into a response header: control characters
+/// (< 0x20 and 0x7f) become `?` and the length is capped at `MAX_ECHOED_HEADER` characters.
+pub fn sanitize_header_value(raw: &str) -> String {
+	raw.chars()
+		.take(MAX_ECHOED_HEADER)
+		.map(|c| if c < ' ' || c == '\x7f' { '?' } else { c })
+		.collect()
+}
+
+/// Applies RFC 7233 semantics to a parsed `bytes=start-end` range over `len` bytes:
+/// `None` (not satisfiable) when `start >= len`, otherwise `end` is clamped to `len - 1`.
+pub fn resolve_byte_range(start: usize, end: usize, len: usize) -> Option<(usize, usize)> {
+	if start >= len || start > end {
+		return None;
+	}
+
+	Some((start, end.min(len - 1)))
 }
 
 /// Разбирает сырой запрос. `max_body` — лимит на размер тела (0 для TBIP).
@@ -124,6 +143,10 @@ pub fn parse_request(raw: &[u8], max_body: usize) -> ParseResult {
 		let key = key.trim().to_lowercase();
 		let value = value.trim().to_string();
 
+		if key == "transfer-encoding" {
+			return ParseResult::BadRequest("Transfer-Encoding is not supported");
+		}
+
 		if key == "content-length" {
 			let parsed = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
 				value.parse::<usize>().ok()
@@ -168,11 +191,10 @@ pub fn parse_request(raw: &[u8], max_body: usize) -> ParseResult {
 		path: request_path,
 		query: query_params,
 		headers: request_headers,
-		content_length,
 		body,
 	}))
 }
 
 #[cfg(test)]
-#[path = "request_tests.rs"]
+#[path = "tests/request_tests.rs"]
 mod tests;

@@ -38,7 +38,14 @@ fn state() -> (TempDir, AppState) {
 		require_secure: false,
 		support_first_version: true,
 		compression_minimum: 1024,
-		compression_cache: dir.join(".cache"),
+		max_body: crate::config::DEFAULT_MAX_BODY,
+		compression_cache: crate::config::DiskCache {
+			dir: dir.join(".cache"),
+			policy: crate::common::DiskCachePolicy {
+				enable: true,
+				source_maximum: u64::MAX,
+			},
+		},
 	};
 
 	(TempDir(dir), state)

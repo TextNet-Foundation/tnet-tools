@@ -16,6 +16,63 @@ pub fn validate_bind_address(address: &str) -> Result<()> {
 		.map_err(|_| anyhow!("bind_address '{address}' is not a valid IP address"))
 }
 
+const MAX_CONNECTIONS_LIMIT: usize = 100_000;
+const MAX_CONNECTION_SECS_LIMIT: u64 = 7 * 24 * 3600;
+
+/// Connection limits must be positive and not absurdly large.
+pub fn validate_limits(max_connections: usize, per_ip: usize, secs: u64) -> Result<()> {
+	if !(1..=MAX_CONNECTIONS_LIMIT).contains(&max_connections) {
+		return Err(anyhow!(
+			"max_connections must be in 1..={MAX_CONNECTIONS_LIMIT}, got {max_connections}"
+		));
+	}
+	if !(1..=MAX_CONNECTIONS_LIMIT).contains(&per_ip) {
+		return Err(anyhow!(
+			"max_connections_per_ip must be in 1..={MAX_CONNECTIONS_LIMIT}, got {per_ip}"
+		));
+	}
+	if !(1..=MAX_CONNECTION_SECS_LIMIT).contains(&secs) {
+		return Err(anyhow!(
+			"max_connection_secs must be in 1..={MAX_CONNECTION_SECS_LIMIT}, got {secs}"
+		));
+	}
+	Ok(())
+}
+
+/// A private key must not be readable by group/others (0600 on unix). With `strict`
+/// that is an error, otherwise only a warning.
+pub fn check_key_permissions(path: &Path, what: &str, strict: bool) -> Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+
+		if let Ok(metadata) = std::fs::metadata(path) {
+			let mode = metadata.permissions().mode() & 0o777;
+
+			if mode & 0o077 != 0 {
+				if strict {
+					return Err(anyhow!(
+						"{what} {} has insecure permissions {mode:04o}, expected 0600 \
+						 (chmod 600 it, or set strict_key_permissions = false)",
+						path.display()
+					));
+				}
+
+				tracing::warn!(
+					path = %path.display(),
+					mode = format!("{mode:04o}"),
+					"{what} is accessible by group/others; chmod 600 it"
+				);
+			}
+		}
+	}
+
+	#[cfg(not(unix))]
+	let _ = (path, what, strict);
+
+	Ok(())
+}
+
 /// Script suffixes must look like `.script.lua`: a dot followed by at least one character.
 pub fn validate_script_extensions(extensions: &[(&str, Option<&str>)]) -> Result<()> {
 	for (name, value) in extensions {

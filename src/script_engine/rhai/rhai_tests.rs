@@ -122,3 +122,26 @@ fn file_helpers_work_and_are_sandboxed() {
 	);
 	assert!(run(&tmp, "fn handle(r) { ok(read_file(\"/etc/passwd\")) }").is_err());
 }
+
+fn run_with_body(tmp: &TempRoot, body: Vec<u8>) -> String {
+	fs::write(
+		tmp.0.join("t.script.rhai"),
+		"fn handle(r) { ok(type_of(r.body) + \":\" + r.body.len()) }",
+	)
+	.expect("write script");
+	let mut req = request();
+	req.body = body;
+	let limits = ScriptLimits {
+		deadline: Duration::from_millis(500),
+		..ScriptLimits::default()
+	};
+	let result = RhaiEngine::new(&tmp.0, None, true).execute("/t", &req, &limits);
+	body_of(result)
+}
+
+#[test]
+fn body_is_string_for_utf8_and_blob_otherwise() {
+	let tmp = TempRoot::new();
+	assert_eq!(run_with_body(&tmp, "hé".as_bytes().to_vec()), "string:2");
+	assert_eq!(run_with_body(&tmp, vec![0xff, 0x00, 0xfe]), "blob:3");
+}

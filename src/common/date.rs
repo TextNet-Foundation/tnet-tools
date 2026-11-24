@@ -35,5 +35,5 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 #[cfg(test)]
-#[path = "date_tests.rs"]
+#[path = "tests/date_tests.rs"]
 mod tests;

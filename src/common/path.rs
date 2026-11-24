@@ -273,5 +273,5 @@ pub fn resolve_path_in(
 }
 
 #[cfg(test)]
-#[path = "path_tests.rs"]
+#[path = "tests/path_tests.rs"]
 mod tests;

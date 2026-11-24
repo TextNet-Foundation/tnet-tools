@@ -121,3 +121,33 @@ async fn utnp_read_is_limited() {
 
 	assert!(error.to_string().contains("size limit"));
 }
+
+#[test]
+fn header_end_handles_every_terminator_style() {
+	assert_eq!(response_header_end(b"A: b\n\nbody"), Some(6));
+	assert_eq!(response_header_end(b"A: b\r\n\r\nbody"), Some(8));
+	assert_eq!(response_header_end(b"A: b\n\r\nbody"), Some(7));
+}
+
+#[test]
+fn header_end_picks_the_earliest_terminator() {
+	// "\n\n" comes first even though a "\r\n\r\n" follows in the body.
+	let buffer = b"A: b\n\nbody\r\n\r\nmore";
+	assert_eq!(response_header_end(buffer), Some(6));
+
+	// "\r\n\r\n" comes first even though a "\n\n" follows.
+	let buffer = b"A: b\r\n\r\nbody\n\nmore";
+	assert_eq!(response_header_end(buffer), Some(8));
+
+	// Mixed ending first, then another terminator.
+	let buffer = b"A: b\n\r\nx\n\ny";
+	assert_eq!(response_header_end(buffer), Some(7));
+}
+
+#[test]
+fn header_end_absent_without_terminator() {
+	assert_eq!(response_header_end(b""), None);
+	assert_eq!(response_header_end(b"A: b\nC: d\n"), None);
+	assert_eq!(response_header_end(b"A: b\r\nC: d\r\n"), None);
+	assert_eq!(response_header_end(b"A: b\r\n\r"), None);
+}

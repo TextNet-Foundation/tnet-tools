@@ -1,11 +1,14 @@
+mod decode;
 mod headers;
 mod sanitize;
 
 use crate::transport::response_header_end;
 use anyhow::{Context, Result, anyhow, bail};
+use decode::decode_body;
 use headers::{header_value, is_success, status_code};
 use sanitize::{render_body, sanitize_terminal};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
@@ -14,6 +17,8 @@ pub struct OutputOptions<'a> {
 	pub output: &'a Option<PathBuf>,
 	pub output_header: &'a Option<PathBuf>,
 	pub output_on_error: bool,
+	/// Keep the body exactly as received: no decompression, no FILE-SHA256 check.
+	pub raw: bool,
 }
 
 /// Process exit code for a response status: 0 for 2x, 1 for anything else.
@@ -21,20 +26,17 @@ pub fn exit_code_for(status: Option<u16>) -> u8 {
 	u8::from(!is_success(status))
 }
 
-/// Compares FILE-SHA256 with the received body.
+/// Compares FILE-SHA256 with the (already decompressed) body.
 ///
-/// The server hashes the original file, so the check is only possible when the
-/// body is the whole file as sent (no Content-Encoding, no Content-Range).
-/// Returns `Ok(true)` when verified, `Ok(false)` when it cannot be checked.
+/// The server hashes the original file, so the check is impossible for partial
+/// (Content-Range) responses. Returns `Ok(true)` when verified, `Ok(false)` when
+/// it cannot be checked.
 pub fn verify_file_sha256(header: &str, body: &[u8]) -> Result<bool> {
 	let Some(expected) = header_value(header, "FILE-SHA256") else {
 		return Ok(false);
 	};
 
-	let encoded = header_value(header, "Content-Encoding")
-		.is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
-
-	if encoded || header_value(header, "Content-Range").is_some() {
+	if header_value(header, "Content-Range").is_some() {
 		return Ok(false);
 	}
 
@@ -78,13 +80,22 @@ pub async fn handle_response(
 		}
 	}
 
-	if success && !head {
-		match verify_file_sha256(&header_text, body) {
-			Ok(true) => eprintln!("FILE-SHA256 verified"),
-			Ok(false) => {}
-			Err(error) => return Err(error),
+	let mut decompressed: Option<Vec<u8>> = None;
+
+	if success && !head && !options.raw {
+		let decoded = decode_body(&header_text, body)?;
+
+		if decoded.verifiable && verify_file_sha256(&header_text, &decoded.data)? {
+			eprintln!("FILE-SHA256 verified");
+		}
+
+		// A hash mismatch returned an error above, before anything is written.
+		if let Cow::Owned(data) = decoded.data {
+			decompressed = Some(data);
 		}
 	}
+
+	let body = decompressed.as_deref().unwrap_or(body);
 
 	if let Some(path) = options.output_header {
 		tokio::fs::write(path, response)

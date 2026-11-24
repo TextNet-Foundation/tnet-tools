@@ -47,9 +47,6 @@ pub fn plaintext_fallback_allowed(allow_insecure: bool, reason: &str) -> Result<
 
 pub async fn exchange_v2(args: &crate::cli::Args, request: &str) -> Result<Vec<u8>> {
 	let policy = policy_from_args(args);
-	#[allow(unused_assignments)]
-	let mut reason = String::from("TLS");
-
 	if args.ssh {
 		println!("Transport: SSH");
 
@@ -76,7 +73,7 @@ pub async fn exchange_v2(args: &crate::cli::Args, request: &str) -> Result<Vec<u
 
 	println!("Transport: TLS");
 
-	match exchange_tls(
+	let reason = match exchange_tls(
 		&args.host,
 		args.port,
 		request,
@@ -94,9 +91,9 @@ pub async fn exchange_v2(args: &crate::cli::Args, request: &str) -> Result<Vec<u
 
 		Err(TlsAttemptError::Unavailable(message)) => {
 			eprintln!("TLS unavailable: {message}");
-			reason = format!("TLS: {message}");
+			format!("TLS: {message}")
 		}
-	}
+	};
 
 	plaintext_fallback_allowed(policy.allow_insecure, &reason)?;
 
@@ -152,5 +149,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "mod_tests.rs"]
+#[path = "tests/mod_tests.rs"]
 mod tests;

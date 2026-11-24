@@ -1,14 +1,12 @@
-use crate::common::{
-	DiskCachePolicy, FileBody, get_compressed_cached, get_compressed_range_cached,
-};
+use crate::common::{FileBody, get_compressed_cached};
 use crate::config::{
-	INVALID_RANGE, OK, OK_EMPTY, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION, TMUTP_VERSION,
-	UNSUPPORTED_RANGE,
+	DiskCache, INVALID_RANGE, OK, OK_EMPTY, RANGE_NOT_SATISFIABLE, SUPPORTED_COMPRESSION,
+	TMUTP_VERSION, UNSUPPORTED_RANGE,
 };
 use crate::handler::response::{RangeParseResult, make_range_error_response, parse_range};
+use crate::range_cache::get_compressed_range_cached;
 use bytes::Bytes;
 use std::fmt::Write;
-use std::path::Path;
 use std::time::SystemTime;
 
 /// Appends the optional trailer headers shared by file and range responses.
@@ -87,14 +85,15 @@ pub async fn make_range_response(
 		}
 	};
 
-	if start >= source_length || end >= source_length {
+	let Some((start, end)) = crate::common::request::resolve_byte_range(start, end, source_length)
+	else {
 		return make_range_error_response(
 			RANGE_NOT_SATISFIABLE,
 			range_header,
 			"outside-source",
 			source_length,
 		);
-	}
+	};
 
 	// Zero-copy view into the cached file.
 	let range_content = content.bytes().slice(start..=end);
@@ -142,14 +141,14 @@ pub async fn make_file_response(
 	modified: Option<SystemTime>,
 	compression: Option<&str>,
 	compression_minimum: usize,
-	cache_dir: &Path,
+	cache: &DiskCache,
 	announce_compression: bool,
 ) -> Vec<u8> {
 	let status = if content.is_empty() { OK_EMPTY } else { OK };
 
 	let compressed = match compression {
 		Some(alg) if content.len() >= compression_minimum => {
-			get_compressed_cached(cache_dir, content, alg, DiskCachePolicy::global())
+			get_compressed_cached(&cache.dir, content, alg, cache.policy)
 				.await
 				.map(|data| (data, alg))
 		}

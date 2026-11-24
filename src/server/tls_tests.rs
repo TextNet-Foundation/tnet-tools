@@ -29,3 +29,12 @@ async fn missing_key_is_an_error_on_unix() {
 		);
 	}
 }
+
+#[test]
+fn strict_key_permissions_default_to_true() {
+	assert!(SecurityConfig::default().strict_key_permissions);
+	let parsed: SecurityConfig = toml::from_str("require_secure = true").unwrap();
+	assert!(parsed.strict_key_permissions);
+	let relaxed: SecurityConfig = toml::from_str("strict_key_permissions = false").unwrap();
+	assert!(!relaxed.strict_key_permissions);
+}

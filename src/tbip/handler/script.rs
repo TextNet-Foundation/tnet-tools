@@ -46,16 +46,20 @@ fn script_failure_response(status: &str) -> Vec<u8> {
 	make_error_response(status, "Script error", "The script could not be executed.")
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Параметры ответа, не зависящие от выбранного движка.
+struct ReplyParams<'a> {
+	method: &'a str,
+	compression: Option<&'a str>,
+	accept_compression_present: bool,
+}
+
 async fn try_engine(
 	engine: Arc<dyn ScriptEngine>,
 	label: &'static str,
 	state: &AppState,
 	script_path: &str,
 	request: &Request,
-	method: &str,
-	compression: Option<&str>,
-	accept_compression_present: bool,
+	reply: ReplyParams<'_>,
 ) -> Option<Vec<u8>> {
 	let has_script = task::spawn_blocking({
 		let engine = engine.clone();
@@ -80,10 +84,10 @@ async fn try_engine(
 	Some(match exec_result {
 		Ok(Some(response)) => make_script_response(
 			response,
-			method,
-			compression,
+			reply.method,
+			reply.compression,
 			state,
-			accept_compression_present,
+			reply.accept_compression_present,
 		),
 		Ok(None) => make_empty_response(),
 		Err(RunError::Busy) => {
@@ -112,9 +116,11 @@ pub async fn try_lua(
 		state,
 		script_path,
 		request,
-		method,
-		compression,
-		accept_compression_present,
+		ReplyParams {
+			method,
+			compression,
+			accept_compression_present,
+		},
 	)
 	.await
 }
@@ -134,9 +140,11 @@ pub async fn try_rhai(
 		state,
 		script_path,
 		request,
-		method,
-		compression,
-		accept_compression_present,
+		ReplyParams {
+			method,
+			compression,
+			accept_compression_present,
+		},
 	)
 	.await
 }

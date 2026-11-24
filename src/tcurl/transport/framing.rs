@@ -18,17 +18,27 @@ pub fn parse_content_length(header: &[u8]) -> Result<usize> {
 	bail!("Response does not contain Content-Length")
 }
 
+/// Returns the end of the header block: the position right after the earliest
+/// terminator among `\n\n`, `\r\n\r\n` and `\n\r\n`.
+///
+/// Every terminator is a line feed directly followed by an empty line, so the
+/// first such line feed decides.
 pub fn response_header_end(response: &[u8]) -> Option<usize> {
-	response
-		.windows(4)
-		.position(|window| window == b"\r\n\r\n")
-		.map(|position| position + 4)
-		.or_else(|| {
-			response
-				.windows(2)
-				.position(|window| window == b"\n\n")
-				.map(|position| position + 2)
-		})
+	response.iter().enumerate().find_map(|(index, byte)| {
+		if *byte != b'\n' {
+			return None;
+		}
+
+		let rest = &response[index + 1..];
+
+		if rest.starts_with(b"\n") {
+			Some(index + 2)
+		} else if rest.starts_with(b"\r\n") {
+			Some(index + 3)
+		} else {
+			None
+		}
+	})
 }
 
 /// Checks a partially received protocol response and cuts bytes that exceed

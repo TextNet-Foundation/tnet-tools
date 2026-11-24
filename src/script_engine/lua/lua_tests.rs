@@ -173,3 +173,90 @@ fn suffix_is_appended_to_name() {
 	assert!(!engine.has_script("/api.html"));
 	assert!(!engine.has_script("/api"));
 }
+
+#[test]
+fn pattern_functions_work_normally() {
+	let tmp = TempRoot::new();
+	let src = "function handle(r)
+		local a = string.find('hello world', 'wor')
+		local b = ('hello'):match('h(.)l')
+		local c = string.gsub('a-b-c', '-', '+')
+		local n = 0
+		for w in string.gmatch('one two three', '%a+') do n = n + 1 end
+		local d = ('abc'):find('b', 1, true)
+		return ok(a .. b .. c .. n .. d)
+	end";
+	assert_eq!(body_of(run(&tmp, src)), "7ea+b+c32");
+}
+
+#[test]
+fn long_patterns_and_subjects_are_rejected_fast() {
+	let tmp = TempRoot::new();
+	let started = std::time::Instant::now();
+	let long_subject = "function handle(r)
+		local s = string.rep('a', 2*1024*1024)
+		return ok(tostring(s:find('(a*)*b')))
+	end";
+	assert!(run(&tmp, long_subject).is_err());
+	// 400 байт: отклоняется по длине шаблона (лимит 256).
+	let long_pattern = "function handle(r)
+		return ok(tostring(string.match('abc', string.rep('a?', 200) .. string.rep('a', 200))))
+	end";
+	assert!(run(&tmp, long_pattern).is_err());
+	let gsub = "function handle(r) return ok((string.rep('a', 2*1024*1024):gsub('a', 'b'))) end";
+	assert!(run(&tmp, gsub).is_err());
+	assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn short_exponential_pattern_is_rejected_by_quantifier_limit() {
+	let tmp = TempRoot::new();
+	let started = std::time::Instant::now();
+	// 180 байт шаблона и 60 байт субъекта: 2^60 шагов, если бы дошло до сопоставления.
+	let script = "function handle(r)
+		local p = string.rep('a?', 60) .. string.rep('a', 60)
+		return ok(tostring(string.find(string.rep('a', 60), p)))
+	end";
+	let error = run(&tmp, script).expect_err("must be rejected, not evaluated");
+	assert!(error.contains("quantifiers"), "unexpected error: {error}");
+	assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn ordinary_patterns_and_plain_find_still_work() {
+	let tmp = TempRoot::new();
+	let script = "function handle(r)
+		local a = string.match('key=value', '^(%w+)=(%w+)$')
+		local b = ('2026-11-24'):match('(%d+)-(%d+)-(%d+)')
+		local c = string.find(string.rep('a?', 60), string.rep('a?', 60), 1, true)
+		return ok(a .. b .. tostring(c))
+	end";
+	assert!(run(&tmp, script).is_ok());
+}
+
+#[test]
+fn quantifier_counter_ignores_escapes_and_sets() {
+	use super::patterns::count_quantifiers;
+	assert_eq!(count_quantifiers(b"a*b+c-d?"), 4);
+	assert_eq!(count_quantifiers(b"%*%+%-%?"), 0);
+	assert_eq!(count_quantifiers(b"[*+-?]x"), 0);
+	assert_eq!(count_quantifiers(b"[^]*]+"), 1);
+	assert_eq!(count_quantifiers(b""), 0);
+}
+
+#[test]
+fn binary_body_is_passed_as_bytes() {
+	let tmp = TempRoot::new();
+	fs::write(
+		tmp.0.join("t.script.lua"),
+		"function handle(r) return ok(r.body) end",
+	)
+	.expect("write script");
+	let mut req = request();
+	req.body = vec![0xff, 0x00, 0xfe, b'a'];
+	let response = LuaEngine::new(&tmp.0, None, true)
+		.execute("/t", &req, &short_limits())
+		.expect("ok")
+		.expect("resp");
+	assert_eq!(response.body, Some(vec![0xff, 0x00, 0xfe, b'a']));
+}

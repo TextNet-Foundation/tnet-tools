@@ -10,10 +10,6 @@ use std::time::Duration;
 /// Максимальный размер блока заголовков.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-/// Максимальный размер тела по умолчанию (используется TMUTP; TBIP передаёт 0).
-#[allow(dead_code)]
-pub const DEFAULT_MAX_BODY: usize = 16 * 1024 * 1024;
-
 /// Простой соединения в ожидании заголовков запроса.
 pub const HEADER_IDLE: Duration = Duration::from_secs(15);
 
@@ -26,6 +22,7 @@ pub enum FrameError {
 	MalformedHeaders,
 	InvalidContentLength,
 	BodyTooLarge,
+	TransferEncodingUnsupported,
 }
 
 impl FrameError {
@@ -35,6 +32,7 @@ impl FrameError {
 			Self::MalformedHeaders => "Request headers are malformed",
 			Self::InvalidContentLength => "Invalid Content-Length header",
 			Self::BodyTooLarge => "Request body exceeds the server limit",
+			Self::TransferEncodingUnsupported => "Transfer-Encoding is not supported",
 		}
 	}
 }
@@ -106,6 +104,12 @@ fn parse_headers(block: &[u8], max_body: usize) -> Result<usize, FrameError> {
 		let Some((key, value)) = trimmed.split_once(':') else {
 			continue;
 		};
+
+		// Тело с Transfer-Encoding фреймится иначе, чем по Content-Length (CL.TE smuggling
+		// за прокси): такие запросы отвергаются до чтения тела.
+		if key.trim().eq_ignore_ascii_case("transfer-encoding") {
+			return Err(FrameError::TransferEncodingUnsupported);
+		}
 
 		if !key.trim().eq_ignore_ascii_case("content-length") {
 			continue;
@@ -199,5 +203,5 @@ impl FrameParser {
 }
 
 #[cfg(test)]
-#[path = "frame_tests.rs"]
+#[path = "tests/frame_tests.rs"]
 mod tests;

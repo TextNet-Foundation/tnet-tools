@@ -1,7 +1,7 @@
 use crate::compression;
 use crate::config::*;
 use std::fmt::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub fn make_version_error_response(version: &str, message: &str) -> Vec<u8> {
 	let mut body = String::new();
@@ -114,7 +114,7 @@ pub fn make_range_error_response(
 		status,
 		body.len(),
 		source_length,
-		requested_range,
+		crate::common::request::sanitize_header_value(requested_range),
 		reason,
 	);
 
@@ -176,7 +176,7 @@ pub async fn serve_static_file(
 	range_header: Option<&str>,
 	compression: Option<&str>,
 	compression_minimum: usize,
-	compression_cache: &Path,
+	compression_cache: &crate::config::DiskCache,
 	accept_compression_present: bool,
 ) -> Vec<u8> {
 	match crate::common::read_file_cached(&full_path).await {
@@ -232,5 +232,5 @@ pub async fn serve_static_file(
 }
 
 #[cfg(test)]
-#[path = "response_tests.rs"]
+#[path = "tests/response_tests.rs"]
 mod tests;

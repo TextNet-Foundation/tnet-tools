@@ -1,7 +1,7 @@
 [advisories]
 ignore = [
 	# chrono stays transitively via russh-util until russh drops it.
-	{ id = "RUSTSEC-2026-0543", reason = "transitive via russh-util; direct use is being removed" },
+	{ id = "RUSTSEC-2026-0543", reason = "transitive via russh-util; no direct dependency, no upstream fix" },
 ]
 # smartstring (RUSTSEC-2026-0249) comes only via rhai; cargo-deny reports
 # unmaintained advisories for direct deps only, so no ignore entry is needed.

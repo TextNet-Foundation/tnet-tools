@@ -225,7 +225,7 @@ pub fn request_table<'lua>(
 	table.set("method", req.method.as_str())?;
 	table.set("path", req.path.as_str())?;
 	table.set("query", map_table(lua, &req.query)?)?;
-	table.set("body", String::from_utf8_lossy(&req.body).into_owned())?;
+	table.set("body", lua.create_string(&req.body)?)?;
 	table.set("form", map_table(lua, &req.form)?)?;
 	table.set("headers", map_table(lua, &req.headers)?)?;
 	Ok(table)

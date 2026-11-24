@@ -69,3 +69,77 @@ fn normalized_rejects_bad_values_and_cache_inside_root() {
 	assert!(bad_bind.normalized(config_path).is_err());
 	let _ = std::fs::remove_dir_all(base);
 }
+
+#[test]
+fn limits_have_defaults_and_are_validated() {
+	let config: Config = toml::from_str("port = 100\nroot = \"./www\"\n").unwrap();
+	assert_eq!(config.max_connections, 256);
+	assert_eq!(config.max_connections_per_ip, 32);
+	assert_eq!(config.max_connection_secs, 3600);
+
+	let base = std::env::temp_dir().join(format!("tnet-tmutp-lim-{}", std::process::id()));
+	let root = base.join("www");
+	std::fs::create_dir_all(&root).unwrap();
+	let config_path = base.join("config.toml");
+	let config_path = config_path.to_str().unwrap();
+
+	for extra in [
+		"max_connections = 0\n",
+		"max_connections_per_ip = 0\n",
+		"max_connection_secs = 0\n",
+		"max_connections = 99999999\n",
+	] {
+		let text = format!("port = 100\nroot = \"{}\"\n{extra}", root.display());
+		let config: Config = toml::from_str(&text).unwrap();
+		assert!(config.normalized(config_path).is_err(), "{extra}");
+	}
+	let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn max_body_default_is_one_mib_and_validated() {
+	assert_eq!(DEFAULT_MAX_BODY, 1024 * 1024);
+	let config: Config = toml::from_str("port = 100\nroot = \"./www\"\n").unwrap();
+	assert_eq!(config.max_body, DEFAULT_MAX_BODY);
+
+	let base = std::env::temp_dir().join(format!("tnet-tmutp-body-{}", std::process::id()));
+	let root = base.join("www");
+	std::fs::create_dir_all(&root).unwrap();
+	let config_path = base.join("config.toml");
+	let config_path = config_path.to_str().unwrap();
+
+	for value in ["0", "999999999999"] {
+		let text = format!(
+			"port = 100\nroot = \"{}\"\nmax_body = {value}\n",
+			root.display()
+		);
+		assert!(Config::prepare(&text, config_path).is_err(), "{value}");
+	}
+	let ok = format!(
+		"port = 100\nroot = \"{}\"\nmax_body = 4096\n",
+		root.display()
+	);
+	assert_eq!(Config::prepare(&ok, config_path).unwrap().max_body, 4096);
+	let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn prepare_runs_normalization() {
+	let base = std::env::temp_dir().join(format!("tnet-tmutp-prep-{}", std::process::id()));
+	let root = base.join("www");
+	std::fs::create_dir_all(&root).unwrap();
+	let config_path = base.join("tmutp-config.toml");
+	let config_path = config_path.to_str().unwrap();
+
+	let inside = format!(
+		"port = 100\nroot = \"{r}\"\ncompression_cache = \"{r}/cache\"\n",
+		r = root.display()
+	);
+	assert!(Config::prepare(&inside, config_path).is_err());
+	assert!(Config::prepare("port = 0\nroot = \"x\"\n", config_path).is_err());
+
+	let ok = format!("port = 100\nroot = \"{}\"\n", root.display());
+	let config = Config::prepare(&ok, config_path).unwrap();
+	assert!(std::path::Path::new(&config.compression_cache).is_absolute());
+	let _ = std::fs::remove_dir_all(base);
+}

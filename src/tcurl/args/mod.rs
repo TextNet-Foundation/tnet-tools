@@ -122,6 +122,11 @@ pub struct Args {
 	#[arg(long = "output-on-error")]
 	pub output_on_error: bool,
 
+	/// Keep the response body exactly as received: do not decompress
+	/// gzip/zstd and do not verify FILE-SHA256.
+	#[arg(long)]
+	pub raw: bool,
+
 	/// Connect and handshake timeout in seconds.
 	#[arg(long, default_value_t = 15)]
 	pub timeout: u64,

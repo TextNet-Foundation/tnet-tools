@@ -112,3 +112,40 @@ fn range_response_uses_cached_hash_and_slice() {
 	);
 	assert_eq!(&response[response.len() - 10..], &content[10..20]);
 }
+
+/// Same table as in the TMUTP tests: both protocols must resolve identical inputs identically.
+const RANGE_TABLE: [(&str, Option<&str>); 6] = [
+	("bytes=0-9", Some("bytes 0-9/10")),
+	("bytes=5-50", Some("bytes 5-9/10")),
+	("bytes=9-9", Some("bytes 9-9/10")),
+	("bytes=0-10", Some("bytes 0-9/10")),
+	("bytes=10-10", None),
+	("bytes=11-20", None),
+];
+
+#[test]
+fn ranges_match_the_shared_table() {
+	let cache = std::env::temp_dir().join(format!("tnet-tbip-rng-{}", std::process::id()));
+	let state = state(cache, 100);
+	let content = body(10, 1);
+
+	for (range, expected) in RANGE_TABLE {
+		let response = make_range_response(
+			&content,
+			None,
+			range,
+			None,
+			&state,
+			Path::new("/x/file.txt"),
+			false,
+		);
+		assert_eq!(
+			header_value(&response, "Content-Range"),
+			expected,
+			"{range}"
+		);
+		if expected.is_none() {
+			assert!(response.starts_with(b"TBIP/2.0 53"), "{range}");
+		}
+	}
+}

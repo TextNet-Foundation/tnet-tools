@@ -1,10 +1,13 @@
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::common::{DEFAULT_CACHE_BUDGET, DEFAULT_MAX_FILE_SIZE};
+use crate::common::conn::{
+	DEFAULT_MAX_CONNECTION_SECS, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_PER_IP,
+};
+use crate::common::{DEFAULT_CACHE_BUDGET, DEFAULT_MAX_FILE_SIZE, DiskCachePolicy};
 use crate::common::{RuntimeSettings, apply_runtime};
 pub use crate::common::{
 	SUPPORTED_COMPRESSION, SecurityConfig, load_ssh_config, load_tls_acceptor,
@@ -20,7 +23,7 @@ pub struct Config {
 	pub port: u16,
 	pub root: String,
 
-	/// Address to listen on. Not applied by the accept loop yet (see report).
+	/// Address to listen on (default `0.0.0.0`).
 	#[serde(default = "default_bind_address")]
 	pub bind_address: String,
 
@@ -53,6 +56,21 @@ pub struct Config {
 	/// Total bytes of file content kept in the in-memory file cache.
 	#[serde(default = "default_file_cache_budget")]
 	pub file_cache_budget: u64,
+
+	/// Maximum number of simultaneous connections.
+	#[serde(default = "default_max_connections")]
+	pub max_connections: usize,
+
+	#[serde(default = "default_max_connections_per_ip")]
+	pub max_connections_per_ip: usize,
+
+	/// Hard lifetime limit of a single connection, in seconds.
+	#[serde(default = "default_max_connection_secs")]
+	pub max_connection_secs: u64,
+
+	/// Largest accepted request body in bytes.
+	#[serde(default = "default_max_body")]
+	pub max_body: usize,
 }
 
 fn default_bind_address() -> String {
@@ -83,11 +101,46 @@ fn default_file_cache_budget() -> u64 {
 	DEFAULT_CACHE_BUDGET
 }
 
+fn default_max_connections() -> usize {
+	DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_max_connections_per_ip() -> usize {
+	DEFAULT_MAX_PER_IP
+}
+
+fn default_max_connection_secs() -> u64 {
+	DEFAULT_MAX_CONNECTION_SECS
+}
+
+fn default_max_body() -> usize {
+	DEFAULT_MAX_BODY
+}
+
+const MAX_BODY_LIMIT: usize = 256 * 1024 * 1024;
+
+fn validate_max_body(max_body: usize) -> Result<()> {
+	if !(1..=MAX_BODY_LIMIT).contains(&max_body) {
+		return Err(anyhow!(
+			"max_body must be in 1..={MAX_BODY_LIMIT} bytes, got {max_body}"
+		));
+	}
+	Ok(())
+}
+
 impl Config {
+	/// Parses the TOML text and normalizes it; this is the only way the server builds its config.
+	pub fn prepare(content: &str, config_path: &str) -> Result<Self> {
+		let config: Config = toml::from_str(content).context("Failed to parse TMUTP config")?;
+		config.normalized(config_path)
+	}
+
 	/// Validates the config, installs process-wide cache limits and returns the config
 	/// with `compression_cache` replaced by its absolute, checked location.
 	/// Fails if the cache directory would lie inside `root`.
 	pub fn normalized(self, config_path: &str) -> Result<Self> {
+		validate_max_body(self.max_body)?;
+
 		let cache_dir = apply_runtime(&RuntimeSettings {
 			port: self.port,
 			bind_address: &self.bind_address,
@@ -95,9 +148,11 @@ impl Config {
 			config_path,
 			compression_cache: &self.compression_cache,
 			compression_cache_enable: self.compression_cache_enable,
-			compression_cache_source_maximum: self.compression_cache_source_maximum,
 			max_file_size: self.max_file_size,
 			file_cache_budget: self.file_cache_budget,
+			max_connections: self.max_connections,
+			max_connections_per_ip: self.max_connections_per_ip,
+			max_connection_secs: self.max_connection_secs,
 			script_extensions: [
 				("lua_extension", self.scripting.lua_extension.as_deref()),
 				("rhai_extension", self.scripting.rhai_extension.as_deref()),
@@ -118,6 +173,16 @@ pub struct Args {
 	pub config: String,
 }
 
+/// Largest request body accepted by default.
+pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
+
+/// Where compressed responses are cached on disk and under which policy.
+#[derive(Clone)]
+pub struct DiskCache {
+	pub dir: PathBuf,
+	pub policy: DiskCachePolicy,
+}
+
 #[derive(Clone)]
 pub struct AppState {
 	pub root: String,
@@ -127,7 +192,8 @@ pub struct AppState {
 	pub require_secure: bool,
 	pub support_first_version: bool,
 	pub compression_minimum: usize,
-	pub compression_cache: PathBuf,
+	pub compression_cache: DiskCache,
+	pub max_body: usize,
 }
 
 // -----------------------------------------------------------------------------

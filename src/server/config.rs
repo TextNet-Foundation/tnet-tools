@@ -47,7 +47,7 @@ fn default_max_connection_secs() -> u64 {
 	ServerLimits::default().max_connection.as_secs()
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
 	#[serde(default)]
@@ -62,9 +62,27 @@ pub struct SecurityConfig {
 	pub tls_private_path: String,
 	#[serde(default = "default_ssh_host_key_path")]
 	pub ssh_host_key_path: String,
-	/// Ошибка (а не предупреждение), если приватный ключ доступен группе/всем.
-	#[serde(default)]
+	/// Ошибка (а не предупреждение), если приватный ключ доступен группе/всем (по умолчанию).
+	#[serde(default = "default_strict_key_permissions")]
 	pub strict_key_permissions: bool,
+}
+
+impl Default for SecurityConfig {
+	fn default() -> Self {
+		Self {
+			require_secure: false,
+			enable_ssh: false,
+			enable_tls: false,
+			tls_public_path: String::new(),
+			tls_private_path: String::new(),
+			ssh_host_key_path: default_ssh_host_key_path(),
+			strict_key_permissions: default_strict_key_permissions(),
+		}
+	}
+}
+
+fn default_strict_key_permissions() -> bool {
+	true
 }
 
 fn default_ssh_host_key_path() -> String {

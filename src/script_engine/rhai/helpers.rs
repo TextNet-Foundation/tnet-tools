@@ -6,9 +6,12 @@ use std::time::Instant;
 
 type RhaiResult<T> = Result<T, Box<EvalAltResult>>;
 
-const MAX_OPERATIONS: u64 = 5_000_000;
-const MAX_STRING_SIZE: usize = 8 * 1024 * 1024;
-const MAX_COLLECTION_SIZE: usize = 100_000;
+// У Rhai нет API общего лимита памяти: ограничиваются только отдельные строки,
+// массивы и map. Поэтому потолок потребления задаётся суммой этих лимитов
+// и числом операций; значения подобраны так, чтобы он оставался разумным.
+const MAX_OPERATIONS: u64 = 1_000_000;
+const MAX_STRING_SIZE: usize = 1024 * 1024;
+const MAX_COLLECTION_SIZE: usize = 10_000;
 const MAX_CALL_LEVELS: usize = 64;
 const MAX_EXPR_DEPTH: usize = 64;
 const MAX_FUNCTION_EXPR_DEPTH: usize = 32;
@@ -94,6 +97,14 @@ pub fn register_helpers(engine: &mut Engine, sandbox: &Sandbox) {
 	});
 }
 
+/// Тело как String, если это валидный UTF-8, иначе как Blob (без потери байтов).
+fn body_value(body: &[u8]) -> Dynamic {
+	match std::str::from_utf8(body) {
+		Ok(text) => Dynamic::from(text.to_string()),
+		Err(_) => Dynamic::from_blob(body.to_vec()),
+	}
+}
+
 /// Строит map `request`.
 pub fn request_map(req: &Request) -> Map {
 	fn to_map(src: &std::collections::HashMap<String, String>) -> Map {
@@ -107,10 +118,7 @@ pub fn request_map(req: &Request) -> Map {
 	m.insert("method".into(), Dynamic::from(req.method.clone()));
 	m.insert("path".into(), Dynamic::from(req.path.clone()));
 	m.insert("query".into(), Dynamic::from(to_map(&req.query)));
-	m.insert(
-		"body".into(),
-		Dynamic::from(String::from_utf8_lossy(&req.body).into_owned()),
-	);
+	m.insert("body".into(), body_value(&req.body));
 	m.insert("form".into(), Dynamic::from(to_map(&req.form)));
 	m.insert("headers".into(), Dynamic::from(to_map(&req.headers)));
 	m

@@ -69,6 +69,21 @@ hide_scripts_behind = true
 | `scripting.order` | Order in which engines are checked |
 | `scripting.hot_reload` | Re-read script from disk on every request |
 | `scripting.hide_scripts_behind` | If true, `/foo.script.lua` is treated as `/foo` (executes the script instead of serving source) |
+| `scripting.timeout_ms` | Time limit of one script run (default 5000) |
+| `scripting.memory_limit_mb` | Memory limit of one Lua script, MiB (default 64) |
+| `scripting.max_concurrent` | Scripts running at once, process-wide (default 32) |
+| `scripting.queue_timeout_ms` | How long a request waits for a free script slot (default 5000) |
+| `bind_address` | Address to listen on (default `127.0.0.1`) |
+| `compression_cache` | Directory of the on-disk compression cache (default `./compression_cache`). Relative paths are resolved against the config file's directory. It must not lie inside `root`: the server refuses to start otherwise. Created with mode 0700 |
+| `max_file_size` | Larger files are not served, bytes (default 256 MiB) |
+| `file_cache_budget` | Total bytes of file content kept in the in-memory cache (default 256 MiB) |
+| `security.strict_key_permissions` | Refuse to start if the TLS key or SSH host key is readable by group/others (default `true`; `false` only logs a warning) |
+| `max_connections` | Simultaneous connections (default 256) |
+| `max_connections_per_ip` | Simultaneous connections per client IP (default 32) |
+| `max_connection_secs` | Maximum lifetime of one connection, seconds (default 3600) |
+| `max_body` | TMUTP only: largest request body, bytes (default 1 MiB, was 16 MiB). TBIP requests never carry a body |
+
+Unknown keys are rejected. UTNP accepts `max_connections`, `max_connections_per_ip`, `max_connection_secs` and `security.strict_key_permissions` as well.
 
 ## Running
 
@@ -178,7 +193,14 @@ fn handle(request) {
 
 - Script exists → it runs. Returning `nil` / `()` produces `22 OK EMPTY`.
 - No script → static file is served.
-- Script error → `40 SERVER ERROR` with the error text in the body.
+- Script error → `40 SERVER ERROR` with the generic text `The script could not be executed.`; details are written to the server log only.
+
+## Security model
+
+- The SSH transport accepts any client (auth `none`): traffic is encrypted, but there is no client authentication. This is deliberate.
+- `Transfer-Encoding` is not supported: any request carrying that header is rejected with `30 BAD REQUEST` before its body is read.
+- Scripts are limited in time and memory (`scripting.timeout_ms`, `scripting.memory_limit_mb`) and in concurrency.
+- Private keys (TLS and SSH host key) must be mode 0600; with the default `strict_key_permissions = true` the server will not start otherwise.
 
 ## Project layout
 

@@ -4,11 +4,10 @@
 mod validate;
 
 use validate::{
-	prepare_cache_dir, resolve_cache_dir, validate_bind_address, validate_port,
-	validate_script_extensions,
+	check_key_permissions, prepare_cache_dir, resolve_cache_dir, validate_bind_address,
+	validate_limits, validate_port, validate_script_extensions,
 };
 
-use super::compression::{DiskCachePolicy, configure_disk_cache};
 use super::file_cache::configure_file_cache;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -40,6 +39,11 @@ pub struct SecurityConfig {
 
 	#[serde(default = "default_ssh_host_key_path")]
 	pub ssh_host_key_path: String,
+
+	/// Refuse to start if a private key is readable by group/others (default).
+	/// When false the problem is only logged as a warning.
+	#[serde(default = "default_strict_key_permissions")]
+	pub strict_key_permissions: bool,
 }
 
 impl Default for SecurityConfig {
@@ -51,8 +55,13 @@ impl Default for SecurityConfig {
 			tls_public_path: String::new(),
 			tls_private_path: String::new(),
 			ssh_host_key_path: default_ssh_host_key_path(),
+			strict_key_permissions: default_strict_key_permissions(),
 		}
 	}
+}
+
+fn default_strict_key_permissions() -> bool {
+	true
 }
 
 fn default_ssh_host_key_path() -> String {
@@ -67,9 +76,11 @@ pub struct RuntimeSettings<'a> {
 	pub config_path: &'a str,
 	pub compression_cache: &'a str,
 	pub compression_cache_enable: bool,
-	pub compression_cache_source_maximum: u64,
 	pub max_file_size: u64,
 	pub file_cache_budget: u64,
+	pub max_connections: usize,
+	pub max_connections_per_ip: usize,
+	pub max_connection_secs: u64,
 	pub script_extensions: [(&'a str, Option<&'a str>); 2],
 }
 
@@ -79,6 +90,11 @@ pub fn apply_runtime(settings: &RuntimeSettings<'_>) -> Result<PathBuf> {
 	validate_port(settings.port)?;
 	validate_bind_address(settings.bind_address)?;
 	validate_script_extensions(&settings.script_extensions)?;
+	validate_limits(
+		settings.max_connections,
+		settings.max_connections_per_ip,
+		settings.max_connection_secs,
+	)?;
 
 	let cache_dir = resolve_cache_dir(
 		settings.compression_cache,
@@ -91,33 +107,8 @@ pub fn apply_runtime(settings: &RuntimeSettings<'_>) -> Result<PathBuf> {
 	}
 
 	configure_file_cache(settings.max_file_size, settings.file_cache_budget);
-	configure_disk_cache(DiskCachePolicy {
-		enable: settings.compression_cache_enable,
-		source_maximum: settings.compression_cache_source_maximum,
-	});
 
 	Ok(cache_dir)
-}
-
-/// Warns when a private key can be read by group or others (should be 0600).
-pub fn warn_if_key_exposed(path: &Path, what: &str) {
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-
-		if let Ok(metadata) = std::fs::metadata(path)
-			&& metadata.permissions().mode() & 0o077 != 0
-		{
-			tracing::warn!(
-				path = %path.display(),
-				mode = format!("{:04o}", metadata.permissions().mode() & 0o7777),
-				"{what} is accessible by group/others; chmod 600 it"
-			);
-		}
-	}
-
-	#[cfg(not(unix))]
-	let _ = (path, what);
 }
 
 pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor> {
@@ -138,7 +129,11 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 		return Err(anyhow!("TLS certificate file contains no certificates"));
 	}
 
-	warn_if_key_exposed(Path::new(&security.tls_private_path), "TLS private key");
+	check_key_permissions(
+		Path::new(&security.tls_private_path),
+		"TLS private key",
+		security.strict_key_permissions,
+	)?;
 
 	let key_bytes = tokio::fs::read(&security.tls_private_path)
 		.await
@@ -158,7 +153,11 @@ pub async fn load_tls_acceptor(security: &SecurityConfig) -> Result<TlsAcceptor>
 pub fn load_ssh_config(security: &SecurityConfig) -> Result<Arc<russh::server::Config>> {
 	let path = &security.ssh_host_key_path;
 
-	warn_if_key_exposed(Path::new(path), "SSH host key");
+	check_key_permissions(
+		Path::new(path),
+		"SSH host key",
+		security.strict_key_permissions,
+	)?;
 
 	let key = russh::keys::load_secret_key(path, None)
 		.with_context(|| format!("Cannot load SSH host key: {}", path))?;

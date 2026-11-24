@@ -1,6 +1,5 @@
 use super::ssh::{RequestHandler, SshHandler};
 use crate::common::conn::{TLS_HANDSHAKE, Transport, sniff_transport};
-use crate::common::frame::DEFAULT_MAX_BODY;
 use crate::config::AppState;
 use crate::handler::process_request;
 use crate::server::stream::serve_stream;
@@ -33,11 +32,12 @@ pub async fn dispatch_connection(
 			let config = ssh_config
 				.ok_or_else(|| anyhow::anyhow!("SSH connection received, but SSH is disabled"))?;
 
+			let max_body = state.max_body;
 			let state = Arc::new(state);
 			let process: RequestHandler<AppState> =
 				Arc::new(|req, st| Box::pin(async move { process_request(&req, &st).await }));
 
-			let handler = SshHandler::new(state, process, DEFAULT_MAX_BODY);
+			let handler = SshHandler::new(state, process, max_body);
 
 			let session = russh::server::run_stream(config, stream, handler).await?;
 			session.await?;

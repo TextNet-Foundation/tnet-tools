@@ -81,15 +81,15 @@ pub fn make_range_response(
 			);
 		}
 	};
-	if start >= source_length {
+	let Some((start, end)) = crate::common::request::resolve_byte_range(start, end, source_length)
+	else {
 		return make_range_error_response(
 			RANGE_NOT_SATISFIABLE,
 			"outside-source",
 			range_header,
 			Some(source_length),
 		);
-	}
-	let end = end.min(source_length - 1);
+	};
 	let range_content = &content[start..=end];
 
 	let compressed = match compression {
@@ -172,7 +172,12 @@ pub fn make_range_error_response(
 	if let Some(length) = source_length {
 		let _ = writeln!(header, "SOURCE-CONTENT-LENGTH: {}", length);
 	}
-	let _ = writeln!(header, "Range-Error: {}; {}", range_header.trim(), reason);
+	let _ = writeln!(
+		header,
+		"Range-Error: {}; {}",
+		crate::common::request::sanitize_header_value(range_header),
+		reason
+	);
 	header.push('\n');
 	let mut response = header.into_bytes();
 	response.extend_from_slice(body.as_bytes());
