@@ -38,7 +38,10 @@ and SSH on one port.
 
 ## Quick start
 
-Requirements: Rust 1.89+. Lua is bundled, no other runtime dependencies.
+Requirements: Rust 1.89+, a C compiler, `pkg-config` and the Lua 5.4
+development files (on Debian and Ubuntu: `build-essential pkg-config
+liblua5.4-dev`). Lua is **not** bundled: the TMUTP and TBIP servers link to the
+system `liblua5.4`, so the machine that runs them needs it too.
 
 ```bash
 cargo build --release
@@ -83,8 +86,9 @@ sleep 2
 
 Stop the servers with `kill %1 %2 %3`.
 
-> `root` is resolved against the current directory. A relative
-> `compression_cache` is resolved against the config file's directory.
+> `root`, the TLS paths and `ssh_host_key_path` are resolved against the current
+> directory. A relative `compression_cache` is resolved against the config
+> file's directory.
 
 ----
 
@@ -100,32 +104,42 @@ tcurl --post -d 'name=bob' tmutp://example.org/form
 tcurl -H 'Accept-Compression: zstd' tbip://example.org/big.txt -o big.txt
 ```
 
-The status line and headers go to stderr, the body to stdout or to `--output`.
-The exit code is `0` for a 2x status and non-zero otherwise. gzip and zstd
-bodies are decompressed, and `FILE-SHA256` is verified when the whole file was
-received (`--raw` turns both off).
+The status line, headers and transport messages go to stderr, the body to stdout
+or to `--output`. When the server is looked up through UTNP, one
+`Resolving ...` line also goes to stdout before the body, so use `-o` if you
+need the exact body. On a terminal, control characters in the body are escaped.
+The exit code is `0` for a 2x status and non-zero otherwise. For a 2x status,
+gzip and zstd bodies are decompressed, and `FILE-SHA256` is verified when the
+whole file was received (`--raw` turns both off). `tcurl` does not ask for
+compression by itself: add `-H 'Accept-Compression: ...'`. Response bodies are
+limited to 256 MiB.
+
+With the default TLS transport, and with `-s`, the UTNP entry of the protocol
+must advertise it (see [TLS and SSH](#tls-and-ssh)); otherwise `tcurl` stops
+with a "security mismatch" error.
 
 | Option | Effect |
 |--------|--------|
 | *(none)* | TLS. Plain TCP is **not** tried if TLS fails |
-| `-s`, `--ssh` | Try SSH, then TLS. The host key must be in `~/.ssh/known_hosts` |
-| `-t`, `--tcp` | Plain TCP |
+| `-s`, `--ssh` | Use SSH. The host key must be in `~/.ssh/known_hosts`. TLS is tried only if the connection is refused, or after other SSH failures with `--allow-insecure-fallback`; an untrusted host key is always fatal |
+| `-t`, `--tcp` | Plain TCP (cannot be combined with `-s`) |
 | `--us` `--ts` `--bs` | SSH for UTNP, TMUTP or TBIP only |
 | `--utcp` `--ttcp` `--btcp` | Plain TCP for UTNP, TMUTP or TBIP only |
 | `--allow-insecure-fallback` | Allow falling back to plain TCP when TLS/SSH cannot be established |
 | `--ca-cert <PEM>` | Trust an additional CA (for example your own) |
 | `--verify-for-sni <NAME>` | Name used for TLS SNI and certificate verification |
 | `-i`, `--ignore-utnp-security` | Connect even if UTNP does not advertise the wanted transport |
-| `--trust-utnp-host` | Accept a different host announced over unprotected UTNP |
+| `--trust-utnp-host` | Accept a different host announced over unprotected UTNP. Also required to send `-H` headers to any host other than the one in the URI, even if UTNP was protected |
 | `--post`, `-d`, `--data-file` | POST with a text or file body (TMUTP) |
 | `--head` | HEAD request (TBIP) |
-| `-H`, `--header` | Add a request header |
+| `-H`, `--header` | Add a request header (`Host` and `Content-Length` are set by `tcurl`) |
 | `-o`, `--output` | Save the body (only for 2x, unless `--output-on-error`) |
-| `--output-header <FILE>` | Save the complete response, headers included |
+| `--output-header <FILE>` | Save the complete response as received, headers included, whatever the status |
+| `--raw` | Do not decompress the body and do not check `FILE-SHA256` |
 | `--utnp-port <PORT>` | UTNP port when the URI names none (default 34) |
 | `--timeout <SECONDS>` | Connect and handshake timeout (default 15) |
-| `--v1` | Protocol 1.0 everywhere, plain TCP |
-| `--uv1` `--tv1` `--bv1` | Protocol 1.0 for UTNP, TMUTP or TBIP only |
+| `--v1` | Protocol 1.0 everywhere, plain TCP (cannot be combined with SSH options or `--ca-cert`) |
+| `--uv1` `--tv1` `--bv1` | Protocol 1.0 for UTNP (always plain TCP), TMUTP or TBIP only |
 
 ## utnp-client
 
@@ -135,9 +149,12 @@ utnp-client -H example.org negotiate tmutp --versions 2.0
 utnp-client -H example.org explore
 ```
 
-It uses TLS by default and SSH with `-s`. `-p` sets the port (default 34).
-`--ca-cert`, `--verify-for-sni`, `--allow-insecure-fallback`, `--timeout` and
-`--v1` work as in `tcurl`.
+It uses TLS by default and SSH with `-s` (same host key and fallback rules as
+`tcurl`). `-H` sets the host (default `localhost`), `-p` the port (default 34).
+`--ca-cert`, `--verify-for-sni`, `--allow-insecure-fallback` and `--timeout`
+work as in `tcurl`. `negotiate` takes exactly one protocol name. `--v1` speaks
+UTNP/1.0 over plain TCP; it has no `explore` and ignores `--versions`. The
+request, the transport and the response are printed to stdout.
 
 ----
 
@@ -145,8 +162,8 @@ It uses TLS by default and SSH with `-s`. `-p` sets the port (default 34).
 
 Each server reads a TOML file. Pass its path with `-c` / `--config`; otherwise
 the server looks for `./utnp-config.toml`, `./tmutp-config.toml` or
-`./tbip-config.toml`. Unknown keys are rejected in the main, `security` and
-protocol sections.
+`./tbip-config.toml`. Unknown keys are an error everywhere except in
+`[scripting]`, where they are silently ignored.
 
 ### UTNP
 
@@ -168,7 +185,12 @@ host = "localhost"
 port = 81
 ```
 
-`version` lists the supported protocol versions; `default-version` is the 1-based position in that list used when the client names no version. A protocol may also set `security = ["tls", "ssh"]`: only the transports enabled in `[security]` are advertised.
+`version` lists the supported protocol versions; `default-version` is the
+1-based position in that list used when the client names no version. When the
+client sends `Supported-Versions`, the highest common version is chosen. `tcurl`
+always sends one (`2.0`, or `1.0` with `--tv1`, `--bv1` or `--v1`). A protocol
+may also set `security = ["tls", "ssh"]`: only the transports enabled in
+`[security]` are advertised.
 
 | Key | Description |
 |-----|-------------|
@@ -178,7 +200,8 @@ port = 81
 
 `bind_address`, `support_first_version`, `max_connections`,
 `max_connections_per_ip`, `max_connection_secs` and `[security]` work as
-described below.
+described below. In addition, `utnp-server` refuses to start with
+`require_secure = true` when neither TLS nor SSH is enabled.
 
 ### TMUTP / TBIP
 
@@ -199,12 +222,12 @@ hide_scripts_behind = true
 |-----|-------------|
 | `port` | Listening port (required) |
 | `root` | Root directory for static files and scripts (required) |
-| `scripting.enabled` | Enable Lua/Rhai script execution |
-| `scripting.lua_extension` | Suffix used to recognize Lua scripts |
-| `scripting.rhai_extension` | Suffix used to recognize Rhai scripts |
-| `scripting.order` | Order in which engines are checked |
-| `scripting.hot_reload` | Re-read script from disk on every request |
-| `scripting.hide_scripts_behind` | If true, `/foo.script.lua` is treated as `/foo` (executes the script instead of serving source) |
+| `scripting.enabled` | Enable Lua/Rhai script execution (default `false`; required if the `[scripting]` section is present) |
+| `scripting.lua_extension` | Suffix of Lua scripts (default `.script.lua`) |
+| `scripting.rhai_extension` | Suffix of Rhai scripts (default `.script.rhai`) |
+| `scripting.order` | Order in which engines are checked (default `["lua", "rhai"]`); an engine that is not listed is not used |
+| `scripting.hot_reload` | Re-read the script from disk on every request (default `true`); `false` caches it until its modification time or size changes |
+| `scripting.hide_scripts_behind` | Strip a script suffix from the request path, so `/foo.script.lua` runs the script of `/foo` (default `true`). Script sources are never served, whatever this is set to |
 | `scripting.timeout_ms` | Time limit of one script run (default 5000) |
 | `scripting.memory_limit_mb` | Memory limit of one Lua script, MiB (default 64) |
 | `scripting.max_concurrent` | Scripts running at once, process-wide (default 32) |
@@ -213,7 +236,6 @@ hide_scripts_behind = true
 | `compression_cache` | Directory of the on-disk compression cache (default `./compression_cache`). Relative paths are resolved against the config file's directory. It must not lie inside `root`: the server refuses to start otherwise. Created with mode 0700 |
 | `max_file_size` | Larger files are not served, bytes (default 256 MiB) |
 | `file_cache_budget` | Total bytes of file content kept in the in-memory cache (default 256 MiB) |
-| `security.strict_key_permissions` | Refuse to start if the TLS key or SSH host key is readable by group/others (default `true`; `false` only logs a warning) |
 | `support_first_version` | Also accept protocol 1.0 clients (default `false`) |
 | `compression_minimum` | Smaller responses are not compressed, bytes (default 1024) |
 | `compression_cache_enable` | Use the on-disk compression cache (default `true`) |
@@ -221,7 +243,7 @@ hide_scripts_behind = true
 | `max_connections` | Simultaneous connections (default 256) |
 | `max_connections_per_ip` | Simultaneous connections per client IP (default 32) |
 | `max_connection_secs` | Maximum lifetime of one connection, seconds (default 3600) |
-| `max_body` | TMUTP only: largest request body, bytes (default 1 MiB, was 16 MiB). TBIP requests never carry a body |
+| `max_body` | TMUTP only: largest request body, bytes (default 1 MiB, at most 256 MiB). TBIP requests never carry a body, and `tbip-server` rejects this key |
 
 ### TLS and SSH
 
@@ -237,11 +259,13 @@ require_secure = false
 
 | Key | Description |
 |-----|-------------|
-| `security.enable_tls` | Accept TLS; needs both TLS paths |
-| `security.enable_ssh` | Accept SSH |
+| `security.enable_tls` | Accept TLS (default `false`); needs both TLS paths |
+| `security.tls_public_path` | TLS certificate chain, PEM |
+| `security.tls_private_path` | TLS private key, PEM |
+| `security.enable_ssh` | Accept SSH (default `false`) |
 | `security.ssh_host_key_path` | SSH host key (default `./ssh_host_ed25519_key`) |
 | `security.require_secure` | Refuse plain TCP requests (default `false`) |
-| `security.strict_key_permissions` | Refuse to start if a private key is readable by group/others (default `true`; `false` only logs a warning) |
+| `security.strict_key_permissions` | Refuse to start if a private key is accessible by group or others (default `true`; `false` only logs a warning) |
 
 Add `security = ["tls", "ssh"]` to the UTNP protocol entries so that clients
 learn which transports are available.
@@ -264,6 +288,29 @@ to 15 seconds for the active ones to finish. `docker stop` waits only 10
 seconds by default; use `docker stop -t 20` to give the server its full time.
 The log level is set with `RUST_LOG`.
 
+### Connections
+
+A connection is not closed after a response: it can carry further requests, and
+the server closes it after 15 seconds of silence. A TMUTP or TBIP client should
+read the body by `Content-Length` instead of waiting for end of stream. UTNP
+responses have no length: over TCP or TLS, close the sending side after the
+request and read to the end, as the bundled clients do.
+
+----
+
+## Static files
+
+When no script handles a request, the file under `root` is served. A path that
+ends in `/` means `index.tmkup` in that directory.
+
+- Dotfiles, dot-directories and `*.toml`, `*.pem`, `*.key` files are answered
+  with `31`, as if they did not exist.
+- Files with a configured script suffix are never served (`32`).
+- A path that leaves `root`, through `..` or a symlink, is answered with `32`.
+
+TMUTP sends files as `text/tmkup`. TBIP picks `Content-Type` from the file
+extension and falls back to `application/octet-stream`.
+
 ----
 
 ## Status codes
@@ -273,11 +320,13 @@ The log level is set with `RUST_LOG`.
 | 20 | OK |
 | 21 | Moved (see `Location`) |
 | 22 | OK, empty |
+| 23 | Multiple choices (TMUTP only, returned by scripts) |
 | 30 | Bad request |
 | 31 | Not found |
 | 32 | Forbidden |
 | 40 | Server error |
-| 42 | Service unavailable |
+| 41 | Not implemented (TMUTP only, returned by scripts) |
+| 42 | Service unavailable (connection limit or no free script slot) |
 | 50 | Method not allowed |
 | 51 | Version not supported |
 | 52 | Invalid range |
@@ -285,8 +334,14 @@ The log level is set with `RUST_LOG`.
 | 54 | Unsupported range |
 | 55 | Secure transport required |
 
-Ranges are single and closed: `Range: bytes=0-99`. Compression is requested
-with `Accept-Compression: gzip, zstd`.
+These codes are used by TMUTP and TBIP; UTNP reports errors as text
+(`UTNP/2.0 ERROR ...`).
+
+Ranges are single and closed, for `GET`: `Range: bytes=0-99`; an end past the
+file is cut to its size. Compression is requested with
+`Accept-Compression: gzip, zstd` (q-values are honored) and applied to bodies of
+at least `compression_minimum` bytes. TBIP sends ranges larger than 256 KiB
+uncompressed.
 
 ----
 
@@ -295,6 +350,7 @@ with `Accept-Compression: gzip, zstd`.
 Scripts live in the `root` directory and are looked up by request path:
 
 - `/submit`  → `submit.script.lua` (or `.script.rhai`)
+- `/api.v2`  → `api.v2.script.lua` (the suffix is appended to the name)
 - `/docs/`   → `docs/index.script.lua`
 - `/`        → `index.script.lua`
 
@@ -303,7 +359,8 @@ no script matches. Scripting is off unless `scripting.enabled = true`.
 
 ### Handler signature
 
-Every script must export `handle(request)` returning a response object.
+Every script must define `handle(request)` that returns a response (a Lua table
+or a Rhai object map).
 
 `request` fields:
 
@@ -311,19 +368,26 @@ Every script must export `handle(request)` returning a response object.
 |-------|------|-------------|
 | `protocol` | string | `"tmutp"` or `"tbip"` |
 | `method` | string | `GET`, `POST` (TMUTP); `GET`, `HEAD` (TBIP) |
-| `path` | string | Request path without query |
+| `path` | string | Percent-decoded, normalized request path without the query |
 | `query` | map | Parsed query parameters |
-| `body` | string | Raw request body |
-| `form` | map | Parsed form fields (application/x-www-form-urlencoded) |
+| `body` | string | Raw request body (empty for TBIP). In Rhai it is a blob if it is not valid UTF-8 |
+| `form` | map | The body of a TMUTP `POST` parsed as `application/x-www-form-urlencoded`, whatever its `Content-Type` is (empty for TBIP) |
 | `headers` | map | Request headers (lower-case keys) |
 
 Response fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | int | yes | TMUTP/TBIP status code |
-| `body` | string / bytes | no | Response body |
-| `headers` | map | no | Extra headers (e.g. `Location`, `Content-Type`) |
+| `status` | int | yes | A code from [Status codes](#status-codes) |
+| `body` | string; blob in Rhai | no | Response body. Lua strings may hold any bytes |
+| `headers` | map of strings | no | Extra headers (e.g. `Location`, `Content-Type`) |
+
+`Content-Length`, `Content-Encoding`, `Content-Range`, `FILE-SHA256` and
+`Supported-Compression` are set only by the server. A response that sets one of
+them, has a malformed header or uses a code unknown to the protocol is replaced
+by an error with status `50`. A number outside 20–55 is a script error (`40`).
+TMUTP adds `Content-Type: text/tmkup` if the script sets none; TBIP adds no
+`Content-Type`.
 
 ### Helper functions
 
@@ -332,14 +396,31 @@ Available in both Lua and Rhai:
 - `ok(body)` → `{ status = 20, body = body }`
 - `empty()` → `{ status = 22 }`
 - `redirect(location)` → `{ status = 21, headers = { Location = location } }`
-- `error(status, body)` → `{ status = status, body = body }` (note: in Rhai the function is `err` to avoid a name clash)
+- `error(status, body)` → `{ status = status, body = body }` (in Rhai the function is `err`). In Lua, any call other than a number followed by a string, such as `error("message")`, is the standard Lua `error`
 
 File helpers (restricted to `root`):
 
-- `read_file(path)`
-- `write_file(path, data)`
+- `read_file(path)`: up to 16 MiB; in Rhai the file must be valid UTF-8
+- `write_file(path, data)`: up to 8 MiB, creates missing directories; in Rhai `data` is a string
 - `exists(path)`
 - `remove_file(path)`
+
+Paths are relative to `root`; `..` and symlinks that lead outside are refused.
+`write_file` and `remove_file` also refuse files ending in `.lua`, `.rhai` or a
+configured script suffix. Reading is not restricted like
+[static files](#static-files): a script can read any file inside `root`.
+
+### Limits
+
+- Both engines: `scripting.timeout_ms`, `scripting.max_concurrent`,
+  `scripting.queue_timeout_ms`. A script file may be up to 1 MiB.
+- Lua: only the base functions, `table`, `string`, `math`, `utf8`, `coroutine`,
+  `os.time` and `os.clock`. There is no `io`, `require`, `package`, `load`,
+  `loadfile`, `dofile`, `debug` or `collectgarbage`. Memory is limited by
+  `scripting.memory_limit_mb`. `string.find`, `match`, `gmatch` and `gsub` limit
+  the subject to 1 MiB, the pattern to 256 bytes and 16 quantifiers.
+- Rhai: no `eval` or `import`; 1,000,000 operations per run, strings up to
+  1 MiB, arrays and maps up to 10,000 elements. `memory_limit_mb` does not apply.
 
 ### Example — Lua
 
@@ -374,7 +455,7 @@ fn handle(request) {
 
     if request.method == "POST" {
         let params = request.form;
-        let mut body = "---tmk-meta\ntitle: \"Form Result\"\n---tmk-meta\n\n";
+        let body = "---tmk-meta\ntitle: \"Form Result\"\n---tmk-meta\n\n";
         for key in params.keys() {
             body += key + ": " + params[key] + "\n";
         }
@@ -391,7 +472,8 @@ fn handle(request) {
 
 - Script exists → it runs. Returning `nil` / `()` produces `22 OK EMPTY`.
 - No script → static file is served.
-- Script error → `40 SERVER ERROR` with the generic text `The script could not be executed.`; details are written to the server log only.
+- Script error or timeout → `40 SERVER ERROR` with the generic text `The script could not be executed.`; details are written to the server log only.
+- No free script slot within `scripting.queue_timeout_ms` → `42 SERVICE UNAVAILABLE`.
 
 ----
 
@@ -399,8 +481,8 @@ fn handle(request) {
 
 - The SSH transport accepts any client (auth `none`): traffic is encrypted, but there is no client authentication. This is deliberate.
 - `Transfer-Encoding` is not supported: any request carrying that header is rejected with `30 BAD REQUEST` before its body is read.
-- Scripts are limited in time and memory (`scripting.timeout_ms`, `scripting.memory_limit_mb`) and in concurrency.
-- Private keys (TLS and SSH host key) must be mode 0600; with the default `strict_key_permissions = true` the server will not start otherwise.
+- Scripts run with the [limits](#limits) above, but treat them as trusted code of the server owner: the sandbox guards against mistakes and runaway scripts, not against a hostile script author.
+- Private keys (TLS and SSH host key) must not be accessible by group or others (`chmod 600`); with the default `strict_key_permissions = true` the server will not start otherwise.
 
 ----
 
@@ -421,9 +503,13 @@ Code rules are in [STYLE.md](STYLE.md), changes in [CHANGELOG.md](CHANGELOG.md).
 ```
 tnet-tools/
 ├── Cargo.toml
+├── CHANGELOG.md
+├── STYLE.md         # code rules
+├── deny.toml        # cargo-deny: licenses and advisories
 └── src/
-    ├── common/          # shared by the servers: framing, request parsing, paths,
+    ├── common/          # shared server code: framing, request parsing, paths,
     │                    # compression, file cache, connection handling, TLS/SSH config
+    │                    # (utnp-server uses only the connection handling)
     ├── script_engine/   # Lua and Rhai engines, sandbox and limits
     ├── server/          # utnp-server
     ├── client/          # utnp-client
@@ -459,9 +545,13 @@ GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 ### Быстрый старт
 
-Нужен Rust 1.89+. Соберите проект командой `cargo build --release` и выполните
-команды из раздела [Quick start](#quick-start): они поднимают все три сервера
-на портах выше 1024 без сертификатов.
+Нужны Rust 1.89+, компилятор C, `pkg-config` и файлы разработки Lua 5.4 (в
+Debian и Ubuntu: `build-essential pkg-config liblua5.4-dev`). Lua **не**
+встроен: серверы TMUTP и TBIP используют системную `liblua5.4`, поэтому она
+нужна и на машине, где они работают. Соберите проект командой
+`cargo build --release` и выполните команды из раздела
+[Quick start](#quick-start): они поднимают все три сервера на портах выше 1024
+без сертификатов.
 
 ### tcurl
 
@@ -474,9 +564,19 @@ tcurl --post -d 'name=bob' tmutp://example.org/form
 ```
 
 По умолчанию используется TLS, и при неудаче `tcurl` **не** переходит на
-открытый TCP. Для TCP есть `-t`, для SSH `-s` (ключ сервера должен быть в
-`~/.ssh/known_hosts`), для своего сертификата `--ca-cert`. Все ключи описаны в
-[таблице выше](#tcurl) и в `tcurl --help`.
+открытый TCP. Для TCP есть `-t`, для своего сертификата `--ca-cert`, для SSH
+`-s` (ключ сервера должен быть в `~/.ssh/known_hosts`). С `-s` переход на TLS
+происходит, только если в соединении отказано, а после других сбоев SSH лишь с
+`--allow-insecure-fallback`.
+
+Без `-t` и `-i` запись протокола в конфиге UTNP должна объявлять нужный
+транспорт (`security = ["tls", "ssh"]`). Статус и заголовки выводятся в stderr,
+тело в stdout, но при поиске через UTNP перед телом в stdout попадает ещё строка
+`Resolving ...`: если нужно точное тело, используйте `-o`. Код выхода `0` только
+для статусов 2x. Все ключи описаны в [таблице выше](#tcurl) и в `tcurl --help`.
+
+`utnp-client` по умолчанию тоже использует TLS (`-s` для SSH, `--v1` для
+UTNP/1.0 по открытому TCP).
 
 ### Настройка и запуск
 
@@ -486,17 +586,33 @@ tcurl --post -d 'name=bob' tmutp://example.org/form
   нём, начиная с 1.
 - По умолчанию серверы слушают только `127.0.0.1`. Чтобы принимать соединения
   снаружи, укажите `bind_address = "0.0.0.0"`.
-- Приватные ключи должны иметь права `0600`, иначе сервер не запустится.
+- `root`, пути к сертификатам и ключам считаются от текущего каталога, а
+  относительный `compression_cache` от каталога конфига. Кэш не должен лежать
+  внутри `root`, и при включённом кэше у сервера должно быть право создать этот
+  каталог.
+- Приватные ключи не должны быть доступны группе и остальным (`chmod 600`),
+  иначе сервер не запустится (если не задано `strict_key_permissions = false`).
 - Клиенты протоколов 1.0 принимаются только при `support_first_version = true`.
 - По SIGINT и SIGTERM сервер перестаёт принимать соединения и до 15 секунд ждёт
-  завершения активных.
+  завершения активных. `docker stop` по умолчанию ждёт лишь 10 секунд, поэтому
+  используйте `docker stop -t 20`.
+- После ответа соединение не закрывается: сервер закрывает его после 15 секунд
+  тишины. Клиент TMUTP и TBIP должен читать тело по `Content-Length`.
+- Скрытые файлы и каталоги (с точки), а также `*.toml`, `*.pem`, `*.key` не
+  отдаются (`31`), исходники скриптов тоже (`32`).
 
 ### Скрипты и безопасность
 
 Скрипты Lua и Rhai лежат в каталоге `root` и включаются через
-`scripting.enabled = true`; формат запроса и ответа описан в разделе
-[Scripting](#scripting). Время, память и число одновременных скриптов
-ограничены. SSH пускает любого клиента: он шифрует канал, но не проверяет, кто
-подключился.
+`scripting.enabled = true`; формат запроса и ответа, коды статусов и ограничения
+описаны в разделах [Scripting](#scripting) и [Status codes](#status-codes).
+Ограничены время и число одновременных скриптов, память Lua и число операций и
+размеры данных Rhai. В Lua нет `io`, `require` и `load`. Это защита от ошибок:
+скрипты считаются доверенным кодом владельца сервера, и читать они могут любой
+файл внутри `root`.
 
-История изменений: [CHANGELOG.md](CHANGELOG.md). Лицензия: GPL-3.0-or-later.
+SSH пускает любого клиента: он шифрует канал, но не проверяет, кто подключился.
+Запросы с заголовком `Transfer-Encoding` отклоняются.
+
+История изменений и то, что может сломаться при обновлении:
+[CHANGELOG.md](CHANGELOG.md). Лицензия: GPL-3.0-or-later.
