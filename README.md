@@ -1,6 +1,6 @@
 # TNet Tools Package
 
-A collection of Rust tools for the TNet text network: three TCP servers (UTNP, TMUTP, TBIP) and a UTNP client.
+A collection of Rust tools for the TNet text network: three TCP servers (UTNP, TMUTP, TBIP) and two clients.
 
 ## Contents
 
@@ -9,7 +9,8 @@ A collection of Rust tools for the TNet text network: three TCP servers (UTNP, T
 | `utnp-server` | 34 | Protocol discovery. Returns host:port for a requested protocol. |
 | `tmutp-server` | 100 | Serves TMkUp documents, handles forms. Lua/Rhai scripting. |
 | `tbip-server` | 81 | Serves binary files (images, audio, video). Lua/Rhai scripting. |
-| `utnp-client` | — | CLI client for UTNP (LIST / NEGOTIATE). |
+| `utnp-client` | — | CLI client for UTNP (LIST / EXPLORE / NEGOTIATE). |
+| `tcurl` | — | CLI client for TMUTP and TBIP; finds the server through UTNP. |
 
 ## Requirements
 
@@ -31,18 +32,24 @@ Each server reads a TOML file. Pass a custom path with `-c` / `--config`; otherw
 ### UTNP
 
 ```toml
+port = 34
+
 [[protocols]]
 name = "tmutp"
-version = "1.0"
+version = ["2.0"]
+default-version = 1
 host = "localhost"
 port = 100
 
 [[protocols]]
 name = "tbip"
-version = "1.0"
+version = ["2.0"]
+default-version = 1
 host = "localhost"
 port = 81
 ```
+
+`version` lists the supported protocol versions; `default-version` is the 1-based position in that list used when the client names no version. A protocol may also set `security = ["tls", "ssh"]`: only the transports enabled in `[security]` are advertised.
 
 ### TMUTP / TBIP
 
@@ -92,6 +99,8 @@ Unknown keys are rejected. UTNP accepts `max_connections`, `max_connections_per_
 ./target/release/tmutp-server  -c ./tmutp-config.toml
 ./target/release/tbip-server   -c ./tbip-config.toml
 ```
+
+On SIGINT (Ctrl+C) or SIGTERM a server stops accepting connections and waits up to 15 seconds for the active ones to finish.
 
 ## Scripting
 
@@ -207,20 +216,18 @@ fn handle(request) {
 ```
 tnet-tools/
 ├── Cargo.toml
-├── utnp-config.toml
-├── tmutp-config.toml
-├── tbip-config.toml
-├── src/
-│   ├── server.rs          # UTNP server
-│   ├── client.rs          # UTNP client
-│   ├── tmutp.rs           # TMUTP server
-│   ├── tbip.rs            # TBIP server
-│   └── script_engine/
-│       ├── mod.rs
-│       ├── lua.rs
-│       └── rhai.rs
-└── www/                   # content and scripts
+└── src/
+    ├── common/          # shared by the servers: framing, request parsing, paths,
+    │                    # compression, file cache, connection handling, TLS/SSH config
+    ├── script_engine/   # Lua and Rhai engines, sandbox and limits
+    ├── server/          # utnp-server
+    ├── client/          # utnp-client
+    ├── tmutp/           # tmutp-server
+    ├── tbip/            # tbip-server
+    └── tcurl/           # tcurl
 ```
+
+Config files and the content directory (`root`) are not part of the repository.
 
 ## License
 
