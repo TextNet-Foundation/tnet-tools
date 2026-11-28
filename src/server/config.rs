@@ -184,3 +184,7 @@ pub fn validate_protocols(protocols: &[Protocol]) -> Result<()> {
 
 	Ok(())
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

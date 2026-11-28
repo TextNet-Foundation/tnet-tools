@@ -101,3 +101,23 @@ async fn shutdown_drains_active_connections() {
 			.is_ok()
 	);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_requests_shutdown() {
+	let waiter = tokio::spawn(shutdown_signal());
+	// Даём задаче установить обработчики до отправки сигнала.
+	tokio::time::sleep(Duration::from_millis(100)).await;
+
+	let sent = std::process::Command::new("kill")
+		.args(["-TERM", &std::process::id().to_string()])
+		.status()
+		.unwrap();
+	assert!(sent.success());
+
+	assert!(
+		tokio::time::timeout(Duration::from_secs(5), waiter)
+			.await
+			.is_ok()
+	);
+}

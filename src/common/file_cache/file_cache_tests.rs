@@ -72,9 +72,8 @@ async fn oversized_file_is_refused() {
 	let path = dir.join("big.bin");
 	std::fs::write(&path, vec![0u8; 2048]).unwrap();
 
-	let previous = MAX_FILE_SIZE.swap(1024, Ordering::Relaxed);
-	let result = read_file_cached(&path).await;
-	MAX_FILE_SIZE.store(previous, Ordering::Relaxed);
+	// The limit is passed in: the process-wide one is shared with parallel tests.
+	let result = read_file_limited(&path, 1024).await;
 
 	assert_eq!(
 		result.err().map(|e| e.kind()),

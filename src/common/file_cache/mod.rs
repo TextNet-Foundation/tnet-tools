@@ -67,10 +67,14 @@ fn changed_error() -> io::Error {
 /// Reads a file through the cache. Files over `max_file_size` are refused with
 /// `ErrorKind::FileTooLarge`; the protocols have no streaming mode to serve them.
 pub async fn read_file_cached(path: &Path) -> io::Result<CachedFile> {
+	read_file_limited(path, MAX_FILE_SIZE.load(Ordering::Relaxed)).await
+}
+
+async fn read_file_limited(path: &Path, max_size: u64) -> io::Result<CachedFile> {
 	let mut last_error = changed_error();
 
 	for _ in 0..READ_ATTEMPTS {
-		match read_once(path).await {
+		match read_once(path, max_size).await {
 			Err(error) if error.kind() == io::ErrorKind::Interrupted => last_error = error,
 			other => return other,
 		}
@@ -79,7 +83,7 @@ pub async fn read_file_cached(path: &Path) -> io::Result<CachedFile> {
 	Err(last_error)
 }
 
-async fn read_once(path: &Path) -> io::Result<CachedFile> {
+async fn read_once(path: &Path, max_size: u64) -> io::Result<CachedFile> {
 	let file = tokio::fs::File::open(path).await?;
 	let metadata = file.metadata().await?;
 
@@ -90,7 +94,7 @@ async fn read_once(path: &Path) -> io::Result<CachedFile> {
 		));
 	}
 
-	if metadata.len() > MAX_FILE_SIZE.load(Ordering::Relaxed) {
+	if metadata.len() > max_size {
 		return Err(io::Error::new(
 			io::ErrorKind::FileTooLarge,
 			"file exceeds max_file_size",

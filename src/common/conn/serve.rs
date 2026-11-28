@@ -88,7 +88,7 @@ impl Drop for IpGuard {
 	}
 }
 
-/// Accept-цикл до Ctrl+C.
+/// Accept-цикл до SIGINT или SIGTERM.
 pub async fn serve<F, Fut>(
 	listener: TcpListener,
 	limits: &ServerLimits,
@@ -99,14 +99,29 @@ where
 	F: Fn(TcpStream, SocketAddr) -> Fut,
 	Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-	serve_until(
-		listener,
-		limits,
-		busy_reply,
-		handler,
-		tokio::signal::ctrl_c(),
-	)
-	.await
+	serve_until(listener, limits, busy_reply, handler, shutdown_signal()).await
+}
+
+/// Ждёт запрос на остановку: Ctrl+C (SIGINT), а на unix ещё и SIGTERM,
+/// которым процесс останавливают systemd и docker.
+async fn shutdown_signal() {
+	#[cfg(unix)]
+	{
+		use tokio::signal::unix::{SignalKind, signal};
+
+		match signal(SignalKind::terminate()) {
+			Ok(mut terminate) => {
+				tokio::select! {
+					_ = tokio::signal::ctrl_c() => {}
+					_ = terminate.recv() => {}
+				}
+				return;
+			}
+			Err(error) => tracing::error!(?error, "cannot listen for SIGTERM"),
+		}
+	}
+
+	let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Accept-цикл: при исчерпании лимитов соединение отклоняется сразу (accept не
