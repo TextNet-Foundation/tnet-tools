@@ -1,0 +1,194 @@
+use crate::common::compress_body;
+use crate::config::*;
+use crate::script_engine::guard::{RunError, run_script, validate_response};
+use crate::script_engine::{Request, Response, ScriptEngine};
+use std::fmt::Write;
+use std::sync::Arc;
+
+pub fn normalize_script_path(decoded_path: &str, state: &crate::config::AppState) -> String {
+	let mut script_path = decoded_path.to_string();
+
+	if state.scripting_config.hide_scripts_behind.unwrap_or(true) {
+		let lua_ext = state
+			.scripting_config
+			.lua_extension
+			.clone()
+			.unwrap_or_else(|| ".script.lua".to_string());
+
+		let rhai_ext = state
+			.scripting_config
+			.rhai_extension
+			.clone()
+			.unwrap_or_else(|| ".script.rhai".to_string());
+
+		let stripped = [&lua_ext, &rhai_ext]
+			.into_iter()
+			.filter(|ext| !ext.is_empty())
+			.find_map(|ext| script_path.strip_suffix(ext.as_str()));
+
+		if let Some(stripped) = stripped {
+			script_path = stripped.to_string();
+		}
+
+		if script_path.is_empty() {
+			script_path = "/".to_string();
+		}
+	}
+
+	script_path
+}
+
+fn script_failure_response(status: &str, title: &str) -> Vec<u8> {
+	crate::handler::response::make_error_response(
+		status,
+		title,
+		"The script could not be executed.",
+	)
+}
+
+pub fn make_script_response(
+	response: Response,
+	compression: Option<&str>,
+	compression_minimum: usize,
+	announce_compression: bool,
+) -> Vec<u8> {
+	if let Err(reason) = validate_response(&response, |code| status_code_to_text(code) != "UNKNOWN")
+	{
+		tracing::error!(reason, "rejected invalid script response");
+		return script_failure_response(METHOD_NOT_ALLOWED, "50 Invalid script response");
+	}
+
+	let status_text = status_code_to_text(response.status);
+	let mut output = String::new();
+	let _ = writeln!(
+		output,
+		"{} {} {}",
+		TMUTP_VERSION, response.status, status_text
+	);
+
+	let has_content_type = response
+		.headers
+		.keys()
+		.any(|key| key.eq_ignore_ascii_case("content-type"));
+
+	for (key, value) in &response.headers {
+		let _ = writeln!(output, "{}: {}", key, value);
+	}
+
+	if !has_content_type {
+		output.push_str("Content-Type: text/tmkup\n");
+	}
+
+	if announce_compression {
+		let _ = writeln!(
+			output,
+			"Supported-Compression: {}",
+			SUPPORTED_COMPRESSION.join(", ")
+		);
+	}
+
+	let original_body = response.body.as_deref().unwrap_or(&[]);
+
+	let (body, content_encoding) = match compression {
+		Some(alg) if original_body.len() >= compression_minimum => {
+			match compress_body(original_body, alg) {
+				Some(data) => (data, Some(alg)),
+				None => (original_body.to_vec(), None),
+			}
+		}
+		_ => (original_body.to_vec(), None),
+	};
+
+	if let Some(alg) = content_encoding {
+		let _ = writeln!(output, "Content-Encoding: {}", alg);
+	}
+
+	let _ = write!(output, "Content-Length: {}\n\n", body.len());
+
+	let mut bytes = output.into_bytes();
+	bytes.extend_from_slice(&body);
+	bytes
+}
+
+pub async fn try_handle_script(
+	state: &crate::config::AppState,
+	script_path: &str,
+	request: &Request,
+	compression: Option<&str>,
+	compression_minimum: usize,
+	accept_compression_present: bool,
+) -> Option<Vec<u8>> {
+	if !state.scripting_config.enabled {
+		return None;
+	}
+
+	let order = state
+		.scripting_config
+		.order
+		.clone()
+		.unwrap_or_else(|| vec!["lua".to_string(), "rhai".to_string()]);
+
+	for engine_name in &order {
+		let (engine, label) = match engine_name.as_str() {
+			"lua" => (
+				state
+					.lua_engine
+					.clone()
+					.map(|engine| engine as Arc<dyn ScriptEngine>),
+				"Lua",
+			),
+			"rhai" => (
+				state
+					.rhai_engine
+					.clone()
+					.map(|engine| engine as Arc<dyn ScriptEngine>),
+				"Rhai",
+			),
+			_ => (None, ""),
+		};
+
+		let Some(engine) = engine else {
+			continue;
+		};
+
+		let has_script = tokio::task::spawn_blocking({
+			let engine = engine.clone();
+			let sp = script_path.to_string();
+			move || engine.has_script(&sp)
+		})
+		.await
+		.unwrap_or(false);
+
+		if !has_script {
+			continue;
+		}
+
+		let exec_result = run_script(
+			engine,
+			script_path.to_string(),
+			request.clone(),
+			&state.scripting_config,
+		)
+		.await;
+
+		return Some(match exec_result {
+			Ok(Some(response)) => make_script_response(
+				response,
+				compression,
+				compression_minimum,
+				accept_compression_present,
+			),
+			Ok(None) => crate::handler::response::make_empty_response(),
+			Err(RunError::Busy) => {
+				tracing::warn!(engine = label, "script slots exhausted");
+				script_failure_response("42 SERVICE UNAVAILABLE", "42 Service unavailable")
+			}
+			Err(RunError::Failed(err)) => {
+				tracing::error!(engine = label, ?err, "script error");
+				script_failure_response(SERVER_ERROR, "40 Server error")
+			}
+		});
+	}
+
+	None
+}
