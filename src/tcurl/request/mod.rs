@@ -20,7 +20,10 @@ pub fn build_request(
 	};
 
 	headers.push(("Host".to_string(), host_header));
-	headers.push(("User-Agent".to_string(), "tcurl/0.1.0".to_string()));
+	headers.push((
+		"User-Agent".to_string(),
+		concat!("tcurl/", env!("CARGO_PKG_VERSION")).to_string(),
+	));
 
 	let mut has_content_type = false;
 
@@ -97,3 +100,7 @@ pub fn protocol_uses_v1(target: &Target, args: &Args) -> bool {
 			Protocol::Tbip => args.bv1,
 		}
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
